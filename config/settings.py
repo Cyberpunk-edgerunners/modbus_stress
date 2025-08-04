@@ -18,7 +18,7 @@ TEST_DURATION = timedelta(hours=0.01).total_seconds()
 BUSY_WAIT_PRECISION = 0.001  # 1ms
 MAX_REGISTERS_PER_READ = 120  # 单次最多读取寄存器数量
 MAX_REGISTERS_PER_WRITE = 120  # 单次最多写入寄存器数量
-DISABLE_NAGLE = True  # 禁用Nagle算法
+DISABLE_NAGLE = False  # 禁用Nagle算法
 
 # 寄存器配置
 INPUT_REGISTER_RANGE = (0, 9)
