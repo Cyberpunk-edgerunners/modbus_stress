@@ -12,7 +12,7 @@ CONTROLLER_IP = "192.168.2.100"  # 直接写死IP，不使用环境变量
 CONTROLLER_PORT = 502
 
 # 测试配置
-TEST_DURATION = timedelta(hours=12).total_seconds()
+TEST_DURATION = timedelta(hours=0.01).total_seconds()
 
 # 性能配置
 BUSY_WAIT_PRECISION = 0.001  # 1ms
