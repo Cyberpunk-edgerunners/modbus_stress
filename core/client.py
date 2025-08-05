@@ -41,25 +41,6 @@ class HighPrecisionModbusClient:
             logger.error("初始连接失败")
             raise ConnectionError("无法建立初始连接")
 
-
-    #     self.kernel132 = ctypes.WinDLL('kernel132')
-    #     self.frequency = ctypes.c_int64
-    #     self.kernel132.QueryPerformanceFrequency(ctypes.byref(self.frequency))
-
-    # def _busy_wait_1ms(self):
-    #     """严格执行1ms忙等待，返回实际耗时"""
-    #     start = ctypes.c_int64()
-    #     self.kernel132.QueryPerformanceFrequency(ctypes.byref(start))
-    #
-    #     target = start.value + (self.frequency.value // 1000) #目标计数值 (+1ms)
-    #
-    #     while True:
-    #         now = ctypes.c_int64()
-    #         self.kernel132.QueryPerformanceFrequency(ctypes.byref(now))
-    #         if now.value > target:
-    #             actual_ns = (now.value - start.value) *1_000_000_000 // self.frequency.value
-    #             return actual_ns / 1_000_000 #返回实际毫秒数
-
     def _busy_wait(self, target_delay):
         """高精度忙等待"""
         start = time.perf_counter()
@@ -145,14 +126,6 @@ class HighPrecisionModbusClient:
             finally:
                 if conn:
                     self.pool.release_connection(conn)
-
-            # # 精确周期控制
-            # if use_busy_wait:
-            #     elapsed = time.time() - cycle_start
-            #     remaining = max(0, settings.BUSY_WAIT_PRECISION - elapsed)
-            #     self._busy_wait(remaining)
-            # elif settings.MASTER_CONFIGS.get("cycle_time"):
-            #     time.sleep(settings.MASTER_CONFIGS["cycle_time"])
 
             try:
                 if conn and not self._random_operation(conn):
