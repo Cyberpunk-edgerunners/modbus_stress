@@ -64,14 +64,14 @@ class HighPrecisionModbusClient:
 
             if op_type == 0:  # 读输入寄存器
                 result = conn.read_input_registers(address=addr, count=count)
-                logger.debug(f"读输入寄存器 {addr}-{addr + count}: {result.registers}")
+                # logger.debug(f"读输入寄存器 {addr}-{addr + count}: {result.registers}")
             elif op_type == 1:  # 读保持寄存器
                 result = conn.read_holding_registers(address=addr, count=count)
-                logger.debug(f"读保持寄存器 {addr}-{addr + count}: {result.registers}")
+                # logger.debug(f"读保持寄存器 {addr}-{addr + count}: {result.registers}")
             else:  # 写保持寄存器
                 values = [random.randint(0, 65535) for _ in range(count)]
                 result = conn.write_registers(address=addr, values=values)
-                logger.debug(f"写保持寄存器 {addr}-{addr + count}: {values}")
+                # logger.debug(f"写保持寄存器 {addr}-{addr + count}: {values}")
 
             latency = (time.time() - start_time) * 1000  # 毫秒
             self.stats["延迟记录"].append(latency)
@@ -95,8 +95,8 @@ class HighPrecisionModbusClient:
         self.stats["周期统计"]["最大周期"] = max(cycles)
         self.stats["周期统计"]["最小周期"] = min(cycles)
 
-        # 计算周期抖动(最近10个周期的标准差)
-        recent_cycles = cycles[-10:] if len(cycles) >= 10 else cycles
+        # 计算周期抖动(最近100个周期的标准差)
+        recent_cycles = cycles[-100:] if len(cycles) >= 100 else cycles
         if len(recent_cycles) > 1:
             mean = sum(recent_cycles) / len(recent_cycles)
             variance = sum((x - mean) ** 2 for x in recent_cycles) / (len(recent_cycles) - 1)
