@@ -128,11 +128,6 @@ class HighPrecisionModbusClient:
                 cycle_start = time.time()
 
                 try:
-                    # 第一次操作
-                    if not self._random_operation(conn):
-                        self._handle_connection_error(conn)
-
-                    # 第二次操作（保持连接复用）
                     if not self._random_operation(conn):
                         self._handle_connection_error(conn)
 
@@ -153,8 +148,7 @@ class HighPrecisionModbusClient:
         except KeyboardInterrupt:
             logger.warning("测试被手动中断")
         finally:
-            # 确保生成最终报告（关键补充）
-            self._generate_report()  # ✅ 确保报告生成
+            self._generate_report()
 
             # 可选：保持长连接供后续使用
             # 如需立即关闭可取消注释下行
