@@ -115,43 +115,50 @@ class HighPrecisionModbusClient:
         )
 
     def run_test(self, duration, use_busy_wait=True):
-        """运行压力测试"""
-        logger.info("开始Modbus压力测试...")
+        """使用长连接运行压力测试（完整版）"""
+        logger.info("开始Modbus长连接压力测试...")
         end_time = time.time() + duration
+        conn = None
 
-        while time.time() < end_time:
-            cycle_start = time.time()
-            conn = self.pool.get_connection()
+        try:
+            # 获取长连接（整个测试周期共用）
+            conn = self.pool.get_persistent_connection()
 
-            try:
-                if conn and not self._random_operation(conn):
-                    self._handle_connection_error(conn)
-            except Exception as e:
-                logger.error(f"测试发生异常: {e}")
-                self._save_error_report(e)
-            finally:
-                if conn:
-                    self.pool.release_connection(conn)
+            while time.time() < end_time:
+                cycle_start = time.time()
 
-            try:
-                if conn and not self._random_operation(conn):
-                    self._handle_connection_error(conn)
-            except Exception as e:
-                logger.error(f"测试发生异常: {e}")
-                self._save_error_report(e)
-            finally:
-                if conn:
-                    self.pool.release_connection(conn)
+                try:
+                    # 第一次操作
+                    if not self._random_operation(conn):
+                        self._handle_connection_error(conn)
 
-                # 计算并记录周期时间
-            cycle_time = time.time() - cycle_start
-            self._update_cycle_stats(cycle_time)
+                    # 第二次操作（保持连接复用）
+                    if not self._random_operation(conn):
+                        self._handle_connection_error(conn)
 
-            # 实时打印周期统计
-            if len(self.stats["周期记录"]) % 100 == 0:  # 每100次打印一次
-                self._print_cycle_stats()
+                except Exception as e:
+                    logger.error(f"测试发生异常: {e}")
+                    self._save_error_report(e)
+                    # 异常后自动获取新连接
+                    conn = self.pool.get_persistent_connection()
 
-        self._generate_report()
+                # 更新统计
+                cycle_time = time.time() - cycle_start
+                self._update_cycle_stats(cycle_time)
+
+                # 定期打印统计
+                if len(self.stats["周期记录"]) % 100 == 0:
+                    self._print_cycle_stats()
+
+        except KeyboardInterrupt:
+            logger.warning("测试被手动中断")
+        finally:
+            # 确保生成最终报告（关键补充）
+            self._generate_report()  # ✅ 确保报告生成
+
+            # 可选：保持长连接供后续使用
+            # 如需立即关闭可取消注释下行
+            self.pool.close_persistent_connection()
 
     def _handle_connection_error(self, conn):
         """处理连接错误"""
