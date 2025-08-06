@@ -33,13 +33,19 @@ class HighPrecisionModbusClient:
         self.client = ModbusTcpClient(
             host=self.host,
             port=self.port,
-            timeout=1.0,
-            no_delay=settings.DISABLE_NAGLE  # 禁用Nagle的新方式
+            timeout=1.0
         )
 
+        # 手动设置TCP_NODELAY
         if not self.client.connect():
-            logger.error("初始连接失败")
             raise ConnectionError("无法建立初始连接")
+
+        if hasattr(self.client, 'socket') and self.client.socket:
+            self.client.socket.setsockopt(
+                socket.IPPROTO_TCP,
+                socket.TCP_NODELAY,
+                1  # 1=禁用Nagle算法
+            )
 
     def _busy_wait(self, target_delay):
         """高精度忙等待"""
