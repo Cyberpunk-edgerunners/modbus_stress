@@ -8,6 +8,7 @@ from loguru import logger
 from pymodbus.exceptions import ModbusException
 from .async_connection import AsyncModbusConnection
 from config import settings
+from pathlib import Path
 
 class HighPrecisionAsyncModbusClient:
     """高精度异步Modbus客户端"""
@@ -27,7 +28,21 @@ class HighPrecisionAsyncModbusClient:
                 "最大周期": 0.0,
                 "最小周期": float('inf'),
                 "周期抖动": 0.0
-            }
+            },
+            "报文延迟统计": {
+                "read_input_registers": [],
+                "read_holding_registers": [],
+                "write_registers": [],
+                "所有报文": []
+            },
+            "延迟百分位": {
+               "p50": 0.0,
+                "p95": 0.0,
+                "p99": 0.0,
+                "最大值": 0.0,
+                "最小值": float('inf')
+        }
+
         }
 
     def _init_clock(self):
@@ -70,24 +85,81 @@ class HighPrecisionAsyncModbusClient:
 
         try:
             start = self._clock()
+            latency_key = ""
+
             if op_type == 0:
                 await client.read_input_registers(address=addr, count=count)
+                latency_key = "read_input_registers"
             elif op_type == 1:
                 await client.read_holding_registers(address=addr, count=count)
+                latency_key = "read_holding_registers"
             else:
                 values = [random.randint(0, 65535) for _ in range(count)]
                 await client.write_registers(address=addr, values=values)
+                latency_key = "write_registers"
 
-            latency = (self._clock() - start) * 1000
-            self.stats["延迟记录"].append(latency)
+            latency_ms = (self._clock() - start) * 1000
+
+            # 记录详细延迟
+            self.stats["报文延迟统计"][latency_key].append(latency_ms)
+            self.stats["报文延迟统计"]["所有报文"].append(latency_ms)
+
+            # 更新全局延迟统计
+            self._update_latency_stats(latency_ms)
+
             self.stats["成功请求"] += 1
             return True
+
         except ModbusException as e:
             logger.error(f"Modbus操作失败: {e}")
             self.stats["失败请求"] += 1
             return False
         finally:
             self.stats["总请求数"] += 1
+
+    def _update_latency_stats(self, latency_ms):
+        """更新延迟百分位统计"""
+        stats = self.stats["延迟百分位"]
+        stats["最大值"] = max(stats["最大值"], latency_ms)
+        stats["最小值"] = min(stats["最小值"], latency_ms)
+
+    def _calculate_percentiles(self, data):
+        """计算百分位延迟"""
+        if not data:
+            return 0.0, 0.0, 0.0
+
+        sorted_data = sorted(data)
+        n = len(sorted_data)
+
+        p50 = sorted_data[int(n * 0.50)]
+        p95 = sorted_data[int(n * 0.95)]
+        p99 = sorted_data[int(n * 0.99)]
+
+        return p50, p95, p99
+
+    def _analyze_latencies(self):
+        """分析所有延迟数据"""
+        all_latencies = self.stats["报文延迟统计"]["所有报文"]
+        if not all_latencies:
+            return
+
+        # 计算百分位
+        p50, p95, p99 = self._calculate_percentiles(all_latencies)
+
+        self.stats["延迟百分位"].update({
+            "p50": p50,
+            "p95": p95,
+            "p99": p99,
+            "最大值": max(all_latencies),
+            "最小值": min(all_latencies)
+        })
+
+        # 各操作类型的平均延迟
+        for op_type in ["read_input_registers", "read_holding_registers", "write_registers"]:
+            latencies = self.stats["报文延迟统计"][op_type]
+            if latencies:
+                avg = sum(latencies) / len(latencies)
+                self.stats["报文延迟统计"][f"{op_type}_平均"] = avg
 
     def _update_cycle_stats(self, cycle_time):
         """更新周期统计数据"""
@@ -142,38 +214,106 @@ class HighPrecisionAsyncModbusClient:
         self._generate_report()
 
     def _generate_report(self):
-        """生成中文测试报告"""
+        """生成包含延迟统计的详细报告"""
+        # 先分析延迟数据
+        self._analyze_latencies()
+
+        # 准备报告内容
         duration = self._clock() - self.stats["开始时间"]
         qps = self.stats["总请求数"] / duration
-        success_rate = (self.stats["成功请求"] / self.stats["总请求数"]) * 100
 
-        report = f"""
-=== Modbus异步测试报告 ===
-测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-运行时长: {duration:.2f}秒
-总请求数: {self.stats["总请求数"]}
-成功请求: {self.stats["成功请求"]}
-失败请求: {self.stats["失败请求"]}
-QPS: {qps:.2f}
-成功率: {success_rate:.2f}%
---- 周期统计 ---
-平均周期: {self.stats['周期统计']['平均周期']:.6f}ms
-最大周期: {self.stats['周期统计']['最大周期']:.6f}ms
-最小周期: {self.stats['周期统计']['最小周期']:.6f}ms
-周期抖动: {self.stats['周期统计']['周期抖动']:.6f}ms
-"""
-        print(report)
+        report_lines = [
+            "=== Modbus异步测试报告 ===",
+            f"测试时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"运行时长: {duration:.2f}秒",
+            f"总请求数: {self.stats['总请求数']}",
+            f"成功请求: {self.stats['成功请求']}",
+            f"失败请求: {self.stats['失败请求']}",
+            f"QPS: {qps:.2f}",
+            f"成功率: {(self.stats['成功请求'] / self.stats['总请求数']) * 100:.2f}%",
+            "",
+            "=== 周期统计 ===",
+            f"平均周期: {self.stats['周期统计']['平均周期']:.6f}ms",
+            f"最大周期: {self.stats['周期统计']['最大周期']:.6f}ms",
+            f"最小周期: {self.stats['周期统计']['最小周期']:.6f}ms",
+            f"周期抖动: {self.stats['周期统计']['周期抖动']:.6f}ms",
+            "",
+            "=== 报文延迟统计 ===",
+            f"总报文数: {len(self.stats['报文延迟统计']['所有报文'])}",
+            f"平均延迟: {sum(self.stats['报文延迟统计']['所有报文']) / len(self.stats['报文延迟统计']['所有报文']):.3f}ms",
+            f"P50延迟: {self.stats['延迟百分位']['p50']:.3f}ms",
+            f"P95延迟: {self.stats['延迟百分位']['p95']:.3f}ms",
+            f"P99延迟: {self.stats['延迟百分位']['p99']:.3f}ms",
+            f"最大延迟: {self.stats['延迟百分位']['最大值']:.3f}ms",
+            f"最小延迟: {self.stats['延迟百分位']['最小值']:.3f}ms",
+            "",
+            "=== 各操作类型延迟 ===",
+            f"读输入寄存器平均: {self.stats['报文延迟统计'].get('read_input_registers_平均', 0):.3f}ms (样本数: {len(self.stats['报文延迟统计']['read_input_registers'])})",
+            f"读保持寄存器平均: {self.stats['报文延迟统计'].get('read_holding_registers_平均', 0):.3f}ms (样本数: {len(self.stats['报文延迟统计']['read_holding_registers'])})",
+            f"写寄存器平均: {self.stats['报文延迟统计'].get('write_registers_平均', 0):.3f}ms (样本数: {len(self.stats['报文延迟统计']['write_registers'])})"
+        ]
+
+        report_content = "\n".join(report_lines)
+
+        # 写入UTF-8文件
+        report_dir = Path("reports")
+        report_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = report_dir / f"modbus_test_{timestamp}.txt"
+
+        try:
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(report_content)
+            logger.info(f"测试报告已保存至: {report_path}")
+        except Exception as e:
+            logger.error(f"保存测试报告失败: {e}")
+
+        # 控制台输出
+        print(report_content)
 
     async def cleanup(self):
-        """异步清理资源"""
+        """终极安全清理"""
+        cleanup_errors = 0
+
+        # 1. 确保测试报告生成
+        try:
+            self._generate_report()
+        except Exception as e:
+            logger.error(f"生成报告失败: {type(e).__name__}")
+            cleanup_errors += 1
+
+        # 2. 恢复时钟精度
         if hasattr(self, '_winmm'):
-            self._winmm.timeEndPeriod(1)
-        await self.pool.close_all()
+            try:
+                self._winmm.timeEndPeriod(1)
+                logger.debug("系统时钟精度已恢复")
+            except Exception as e:
+                logger.error(f"恢复时钟精度失败: {type(e).__name__}")
+                cleanup_errors += 1
+            finally:
+                self._winmm = None
 
-    async def __aenter__(self):
-        return self
+        # 3. 关闭连接池（带超时保护）
+        if hasattr(self, 'pool'):
+            try:
+                # 添加超时保护
+                await asyncio.wait_for(self.pool.close_all(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.error("关闭连接池超时")
+                cleanup_errors += 1
+            except Exception as e:
+                logger.error(f"关闭连接池失败: {type(e).__name__}")
+                cleanup_errors += 1
+            finally:
+                self.pool = None
 
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.cleanup()
+        # 4. 清理统计信息
+        self.stats.clear()
+
+        if cleanup_errors > 0:
+            logger.warning(f"清理完成，但有{cleanup_errors}个错误")
+        else:
+            logger.info("所有资源已安全释放")
+
 
 

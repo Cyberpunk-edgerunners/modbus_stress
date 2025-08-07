@@ -48,29 +48,71 @@ class AsyncModbusConnection:
             raise
 
     async def get_connection(self):
-        """获取长连接"""
+        """获取长连接（带重试机制）"""
         await self.initialize()
-        while True:
-            for conn in self._connections:
-                if conn.connected:
-                    return conn
-            logger.warning("无可用连接，尝试重建...")
-            await asyncio.sleep(1)
-            await self.initialize()
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            for i, conn in enumerate(self._connections):
+                try:
+                    if conn is None:
+                        continue
+
+                    if not hasattr(conn, 'connected'):
+                        logger.warning(f"无效连接对象: {type(conn)}")
+                        self._connections[i] = None
+                        continue
+
+                    if conn.connected:
+                        return conn
+
+                except Exception as e:
+                    logger.error(f"检查连接状态出错: {e}")
+                    self._connections[i] = None
+
+            # 所有连接都不可用，尝试重建
+            if attempt < max_retries - 1:
+                logger.warning(f"无可用连接，尝试重建... (尝试 {attempt + 1}/{max_retries})")
+                await asyncio.sleep(1)
+                await self.initialize()
+
+        raise ConnectionError("无法获取有效连接")
 
     async def close_all(self):
-        """安全关闭所有连接"""
+        """终极安全关闭方法"""
         async with self._lock:
+            if not hasattr(self, '_connections'):
+                logger.warning("连接池已被清空，无需关闭")
+                return
+
             for i in range(len(self._connections)):
                 conn = self._connections[i]
                 try:
-                    if conn and hasattr(conn, 'close') and conn.connected:
+                    # 使用getattr安全检查，避免属性错误
+                    if conn is None:
+                        logger.debug(f"连接{i}已为None，跳过")
+                        continue
+
+                    if not getattr(conn, 'connected', False):
+                        logger.debug(f"连接{i}已断开，无需关闭")
+                        continue
+
+                    # 终极保护：检查是否可await
+                    if hasattr(conn, 'close') and callable(getattr(conn, 'close', None)):
                         await conn.close()
+                        logger.debug(f"连接{i}已关闭")
+                    else:
+                        logger.warning(f"连接{i}没有可调用的close方法")
+
                 except Exception as e:
-                    logger.error(f"关闭连接时出错: {e}")
+                    logger.error(f"关闭连接{i}时出错: {type(e).__name__}: {str(e)}")
                 finally:
+                    # 确保设置为None
                     self._connections[i] = None
+
             self._connections = []
             self._initialized = False
-            logger.info("所有连接已关闭")
+            logger.info("连接池已完全关闭")
+
+
 
