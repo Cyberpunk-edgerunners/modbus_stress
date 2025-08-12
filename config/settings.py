@@ -12,10 +12,17 @@ CONTROLLER_IP = "192.168.2.100"  # 直接写死IP，不使用环境变量
 CONTROLLER_PORT = 502
 
 # 测试配置
-TEST_DURATION = timedelta(hours=0.01).total_seconds()
+TEST_DURATION = timedelta(hours=0.001).total_seconds()
 
 # 性能配置
 BUSY_WAIT_PRECISION = 0.001  # 1ms
+CYCLE_TIME = 0.001
+TARGET_FREQUENCY = 1000  #500HZ(2ms)
+
+# 新增实时调度配置
+REALTIME_PRIORITY = True  # 是否启用实时优先级
+REALTIME_CPU_CORE = 3     # 绑定到指定CPU核心
+
 MAX_REGISTERS_PER_READ = 120  # 单次最多读取寄存器数量
 MAX_REGISTERS_PER_WRITE = 120  # 单次最多写入寄存器数量
 DISABLE_NAGLE = True  # 禁用Nagle算法
@@ -51,7 +58,7 @@ MASTER_CONFIGS = {
 }
 
 # 连接池配置
-CONNECTION_POOL_SIZE = 3
+CONNECTION_POOL_SIZE = 4
 CONNECT_TIMEOUT = 3.0
 CONNECT_RETRIES = 3
 RESPONSE_TIMEOUT = 2.0  # 响应超时
@@ -59,3 +66,5 @@ RESPONSE_TIMEOUT = 2.0  # 响应超时
 # 日志配置
 LOG_LEVEL = "DEBUG"
 LOG_ROTATION = "100 MB"  # 日志轮转大小
+
+
