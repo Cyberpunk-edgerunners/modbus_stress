@@ -9,13 +9,24 @@ from pymodbus.exceptions import ModbusException
 from .async_connection import AsyncModbusConnection
 from config import settings
 from pathlib import Path
+import win32api
+import win32con
+import win32process
+
+#Windows API 常量定义
+PROCESS_ALL_ACCESS = 0x1F0FFF
+REALTIME_PRIORITY_CLASS = 0x00000100
+HIGH_PRIORITY_CLASS = 0x00000080
 
 class HighPrecisionAsyncModbusClient:
-    """高精度异步Modbus客户端"""
+    """异步Modbus客户端(Windows环境实时)"""
     def __init__(self):
         self.pool = AsyncModbusConnection()
         self._init_clock()
-        self._set_clock_resolution()
+        self._init_realtime()
+        self._stats_init()
+
+    def _stats_init(self):
         self.stats = {
             "总请求数": 0,
             "成功请求": 0,
@@ -41,8 +52,7 @@ class HighPrecisionAsyncModbusClient:
                 "p99": 0.0,
                 "最大值": 0.0,
                 "最小值": float('inf')
-        }
-
+            }
         }
 
     def _init_clock(self):
@@ -61,21 +71,118 @@ class HighPrecisionAsyncModbusClient:
         self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
         return counter.value / self._qpc_freq.value
 
-    def _set_clock_resolution(self):
-        """Windows平台设置高精度时钟分辨率"""
-        if sys.platform == 'win32':
-            self._winmm = ctypes.windll.winmm
-            self._winmm.timeBeginPeriod(1)
+    def _init_realtime(self):
+        """Windows实时环境初始化"""
+        if sys.platform != "win32":
+            return
+
+        # 1. 提高系统时钟精度
+        self._winmm = ctypes.WinDLL('winmm')
+        self._winmm.timeBeginPeriod(1)
+        logger.debug("系统时钟精度已设置为1ms")
+
+        # 2. 设置进程优先级
+        if settings.REALTIME_PRIORITY:
+            self._set_process_priority(REALTIME_PRIORITY_CLASS)
+
+        # 3. CPU亲和性设置
+        if hasattr(settings, 'REALTIME_CPU_CORE') and settings.REALTIME_CPU_CORE >= 0:
+            try:
+                self._set_cpu_affinity(settings.REALTIME_CPU_CORE)
+                logger.success(f"成功绑定到CPU核心 {settings.REALTIME_CPU_CORE}")
+            except Exception as e:
+                logger.error(f"CPU绑定失败: {e}")
+
+    def _set_process_priority(self, priority_class):
+        """安全的进程优先级设置"""
+        try:
+            # 正确获取当前进程ID
+            pid = win32api.GetCurrentProcessId()
+
+            # 使用win32api打开进程（替代ctypes直接调用）
+            handle = win32api.OpenProcess(
+                win32con.PROCESS_ALL_ACCESS,  # 使用标准权限
+                False,  # 不继承句柄
+                pid
+            )
+
+            # 设置优先级
+            win32process.SetPriorityClass(handle, priority_class)
+
+            # 立即关闭句柄防止泄漏
+            win32api.CloseHandle(handle)
+
+            logger.success(f"成功设置进程优先级: {self._priority_name(priority_class)}")
+        except Exception as e:
+            logger.error(f"优先级设置失败: {e}")
+            raise RuntimeError("进程优先级设置失败") from e
+
+    def _priority_name(self, class_code):
+        """将优先级代码转为可读名称"""
+        return {
+            REALTIME_PRIORITY_CLASS: "实时",
+            HIGH_PRIORITY_CLASS: "高",
+            win32con.NORMAL_PRIORITY_CLASS: "正常"
+        }.get(class_code, f"未知({class_code:#x})")
+
+    def _set_cpu_affinity(self, core_id):
+        try:
+            pid = win32api.GetCurrentProcessId()
+            hProcess = win32api.OpenProcess(
+                win32con.PROCESS_ALL_ACCESS,
+                False,
+                pid
+            )
+
+            # 获取当前亲和性掩码
+            old_mask = win32process.GetProcessAffinityMask(hProcess)[0]
+
+            # 设置新亲和性
+            new_mask = 1 << core_id
+            win32process.SetProcessAffinityMask(hProcess, new_mask)
+
+            # 验证设置
+            current_mask = win32process.GetProcessAffinityMask(hProcess)[0]
+            if current_mask != new_mask:
+                raise RuntimeError(f"CPU亲和性设置失败 (当前: {bin(current_mask)}, 预期: {bin(new_mask)})")
+
+        except Exception as e:
+            logger.error(f"CPU核心绑定异常: {e}")
+            raise
+        finally:
+            if 'hProcess' in locals():
+                win32api.CloseHandle(hProcess)
 
     def _busy_wait(self, target_delay):
         """高精度忙等待"""
         start = self._clock()
-        while True:
-            current = self._clock()
-            if current - start >= target_delay:
-                break
-            if target_delay - (current - start) > 0.002:
-                time.sleep(0.001)
+        while (self._clock() - start) < target_delay:
+            if target_delay - (self._clock() - start) > 0.002:
+                time.sleep(0.001)  # 减少CPU占用
+
+    # def _control_cycle_timing(self, cycle_start, warmup_cycles):
+    #     """精确控制周期时间"""
+    #     elapsed = self._clock() - cycle_start
+    #     target_wait =  max(0, settings.BUSY_WAIT_PRECISION - elapsed)
+    #
+    #     if target_wait > 0.001:
+    #         # 混合等待策略   注意可能有问题，暂未完全搞懂
+    #         asyncio.run_coroutine_threadsafe(
+    #             asyncio.sleep(target_wait * 0.3),
+    #             asyncio.get_event_loop()
+    #         )
+    #         self._busy_wait(target_wait * 0.7)
+
+    def _control_cycle_timing(self, cycle_start):
+        """纯忙等待实现（移除了warmup_cycles参数）"""
+        target_cycle = 1.0 / settings.TARGET_FREQUENCY  # 计算目标周期时间(秒)
+        elapsed = self._clock() - cycle_start
+        remaining = max(0, target_cycle - elapsed)
+
+        # 纯忙等待实现
+        end_time = cycle_start + target_cycle
+        while self._clock() < end_time:
+            pass
 
     async def _random_operation(self, client):
         """执行随机Modbus操作（修正版）"""
@@ -179,12 +286,12 @@ class HighPrecisionAsyncModbusClient:
             stats["周期抖动"] = variance ** 0.5
 
     async def run_test(self, duration):
-        """运行异步压力测试"""
-        logger.info("开始异步长连接压力测试...")
+        """运行压力测试"""
+        logger.info("开始实时优化长连接压力测试...")
         end_time = self._clock() + duration
         client = await self.pool.get_connection()
 
-        # 预热阶段(忽略前10个周期的统计)
+        # 预热阶段
         warmup_cycles = 10
 
         while self._clock() < end_time:
@@ -199,11 +306,7 @@ class HighPrecisionAsyncModbusClient:
                 client = await self.pool.get_connection()
 
             # 精确周期控制(动态调整)
-            elapsed = self._clock() - cycle_start
-            target_wait = max(0, settings.BUSY_WAIT_PRECISION - elapsed)
-            if target_wait > 0.001:  # 只对较长的等待使用sleep
-                await asyncio.sleep(target_wait * 0.5)  # 部分异步等待
-                self._busy_wait(target_wait * 0.5)  # 部分忙等待
+            self._control_cycle_timing(cycle_start)
 
             # 更新统计(跳过预热周期)
             if warmup_cycles <= 0:
@@ -256,7 +359,7 @@ class HighPrecisionAsyncModbusClient:
         report_content = "\n".join(report_lines)
 
         # 写入UTF-8文件
-        report_dir = Path("reports")
+        report_dir = Path(r"E:\QJRobot\Source Code\qj-pytest\modbus_stress\reports")
         report_dir.mkdir(exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = report_dir / f"modbus_test_{timestamp}.txt"
@@ -314,6 +417,3 @@ class HighPrecisionAsyncModbusClient:
             logger.warning(f"清理完成，但有{cleanup_errors}个错误")
         else:
             logger.info("所有资源已安全释放")
-
-
-
