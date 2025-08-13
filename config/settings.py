@@ -10,13 +10,20 @@ load_dotenv()
 
 CONTROLLER_IP = "192.168.2.100"  # 直接写死IP，不使用环境变量
 CONTROLLER_PORT = 502
+CLIENT_BASE_PORT = 10000  # 客户端起始端口
+
+
+# 连接池配置
+CONNECTION_POOL_SIZE = 4
+CONNECT_TIMEOUT = 5.0
+CONNECT_RETRIES = 3
+RESPONSE_TIMEOUT = 3.0  # 响应超时
 
 # 测试配置
 TEST_DURATION = timedelta(hours=0.001).total_seconds()
 
 # 性能配置
-BUSY_WAIT_PRECISION = 0.001  # 1ms
-CYCLE_TIME = 0.001
+BUSY_WAIT_PRECISION = 0.0001  # 1ms
 TARGET_FREQUENCY = 1000  #500HZ(2ms)
 
 # 新增实时调度配置
@@ -57,11 +64,6 @@ MASTER_CONFIGS = {
     }
 }
 
-# 连接池配置
-CONNECTION_POOL_SIZE = 4
-CONNECT_TIMEOUT = 3.0
-CONNECT_RETRIES = 3
-RESPONSE_TIMEOUT = 2.0  # 响应超时
 
 # 日志配置
 LOG_LEVEL = "DEBUG"

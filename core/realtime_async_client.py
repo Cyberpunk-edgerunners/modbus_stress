@@ -1,4 +1,5 @@
 import sys
+import os
 import time
 import ctypes
 import random
@@ -12,11 +13,18 @@ from pathlib import Path
 import win32api
 import win32con
 import win32process
+import traceback
 
 #Windows API 常量定义
 PROCESS_ALL_ACCESS = 0x1F0FFF
 REALTIME_PRIORITY_CLASS = 0x00000100
 HIGH_PRIORITY_CLASS = 0x00000080
+
+THREAD_PRIORITY_TIME_CRITICAL = 15
+THREAD_PRIORITY_HIGHEST = 2
+THREAD_PRIORITY_NORMAL = 0
+
+MAX_CYCLE_THRESHOLD = 0.020  # 20ms阈值
 
 class HighPrecisionAsyncModbusClient:
     """异步Modbus客户端(Windows环境实时)"""
@@ -25,6 +33,22 @@ class HighPrecisionAsyncModbusClient:
         self._init_clock()
         self._init_realtime()
         self._stats_init()
+        # self._setup_logging()
+
+        self.errors_dir = Path("errors")
+        self.errors_dir.mkdir(exist_ok=True)
+
+        # 初始化异常日志文件
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.anomaly_log_path = self.errors_dir / f"cycle_anomalies_{timestamp}.log"
+
+        # 写入日志头
+        with open(self.anomaly_log_path, "w", encoding="utf-8") as f:
+            f.write("=== 周期异常日志 ===\n")
+            f.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("格式: [时间戳] 周期(ms) | 平均周期 | 最大周期 | 抖动 | 调用栈\n")
+            f.write("-" * 80 + "\n")
+
 
     def _stats_init(self):
         self.stats = {
@@ -85,7 +109,16 @@ class HighPrecisionAsyncModbusClient:
         if settings.REALTIME_PRIORITY:
             self._set_process_priority(REALTIME_PRIORITY_CLASS)
 
-        # 3. CPU亲和性设置
+        # 3. 设置线程优先级
+        if settings.REALTIME_PRIORITY:
+            try:
+                self._set_thread_priority(THREAD_PRIORITY_TIME_CRITICAL)
+            except RuntimeError:
+                # 如果设置最高优先级失败，尝试设置高优先级
+                logger.warning("无法设置TIME_CRITICAL优先级，尝试设置HIGHEST优先级")
+                self._set_thread_priority(THREAD_PRIORITY_HIGHEST)
+
+        # 4. CPU亲和性设置
         if hasattr(settings, 'REALTIME_CPU_CORE') and settings.REALTIME_CPU_CORE >= 0:
             try:
                 self._set_cpu_affinity(settings.REALTIME_CPU_CORE)
@@ -125,6 +158,29 @@ class HighPrecisionAsyncModbusClient:
             win32con.NORMAL_PRIORITY_CLASS: "正常"
         }.get(class_code, f"未知({class_code:#x})")
 
+    def _set_thread_priority(self, priority_level=THREAD_PRIORITY_TIME_CRITICAL):
+        # 设置当前线程优先级
+
+        try:
+            # 使用 win32api 替代 ctypes 直接调用
+            thread_handle = win32api.GetCurrentThread()
+
+            # 设置线程优先级
+            win32process.SetThreadPriority(thread_handle, priority_level)
+
+            logger.success(f"线程优先级已设置为: {self._thread_priority_name(priority_level)}")
+        except Exception as e:
+            logger.error(f"线程优先级设置失败: {e}")
+            raise RuntimeError("线程优先级设置失败") from e
+
+    def _thread_priority_name(self, priority_level):
+        """将线程优先级代码转为可读名称"""
+        return {
+            THREAD_PRIORITY_TIME_CRITICAL: "TIME_CRITICAL(15)",
+            THREAD_PRIORITY_HIGHEST: "HIGHEST(2)",
+            THREAD_PRIORITY_NORMAL: "NORMAL(0)"
+        }.get(priority_level, f"未知({priority_level})")
+
     def _set_cpu_affinity(self, core_id):
         try:
             pid = win32api.GetCurrentProcessId()
@@ -153,36 +209,112 @@ class HighPrecisionAsyncModbusClient:
             if 'hProcess' in locals():
                 win32api.CloseHandle(hProcess)
 
-    def _busy_wait(self, target_delay):
-        """高精度忙等待"""
-        start = self._clock()
-        while (self._clock() - start) < target_delay:
-            if target_delay - (self._clock() - start) > 0.002:
-                time.sleep(0.001)  # 减少CPU占用
-
-    # def _control_cycle_timing(self, cycle_start, warmup_cycles):
-    #     """精确控制周期时间"""
+    # def _control_cycle_timing(self, cycle_start):
+    #     """混合精度周期控制(C扩展)"""
+    #     target_cycle = 1.0 / settings.TARGET_FREQUENCY
     #     elapsed = self._clock() - cycle_start
-    #     target_wait =  max(0, settings.BUSY_WAIT_PRECISION - elapsed)
+    #     remaining = max(0, target_cycle - elapsed)
     #
-    #     if target_wait > 0.001:
-    #         # 混合等待策略   注意可能有问题，暂未完全搞懂
-    #         asyncio.run_coroutine_threadsafe(
-    #             asyncio.sleep(target_wait * 0.3),
-    #             asyncio.get_event_loop()
-    #         )
-    #         self._busy_wait(target_wait * 0.7)
+    #     if remaining > 0.002:  # >2ms使用混合等待
+    #         time.sleep(remaining * 0.8)  # 80%时间释放CPU
+    #         end_time = cycle_start + target_cycle
+    #         while self._clock() < end_time:  # 20%忙等待
+    #             pass
+    #     else:  # ≤2ms纯忙等待
+    #         end_time = cycle_start + target_cycle
+    #         if hasattr(self, '_rtlib'):  # 使用C扩展优化
+    #             self._rtlib.precise_wait_us(int(remaining * 1e6))
+    #         else:
+    #             while self._clock() < end_time:
+    #                 pass
+
+    # def _control_cycle_timing(self, cycle_start):
+    #     """纯忙等待实现"""
+    #     target_cycle = 1.0 / settings.TARGET_FREQUENCY  # 计算目标周期时间(秒)
+    #     elapsed = self._clock() - cycle_start
+    #     remaining = max(0, target_cycle - elapsed)
+    #
+    #     # 纯忙等待实现
+    #     end_time = cycle_start + target_cycle
+    #     while self._clock() < end_time:
+    #         pass
 
     def _control_cycle_timing(self, cycle_start):
-        """纯忙等待实现（移除了warmup_cycles参数）"""
-        target_cycle = 1.0 / settings.TARGET_FREQUENCY  # 计算目标周期时间(秒)
+        """混合精度周期控制（纯Python实现）"""
+        target_cycle = 1.0 / settings.TARGET_FREQUENCY
         elapsed = self._clock() - cycle_start
         remaining = max(0, target_cycle - elapsed)
 
-        # 纯忙等待实现
-        end_time = cycle_start + target_cycle
+        if remaining > 0:
+            # 分级等待策略
+            if remaining > 0.01:  # >10ms
+                time.sleep(remaining * 0.9)  # 90%时间Sleep
+                self._busy_wait(remaining * 0.1)  # 最后10%忙等待
+            elif remaining > 0.002:  # 2-10ms
+                time.sleep(remaining * 0.7)
+                self._busy_wait(remaining * 0.3)
+            else:  # <2ms纯忙等待
+                self._busy_wait(remaining)
+
+    def _busy_wait(self, duration):
+        """优化的忙等待"""
+        end_time = self._clock() + duration
         while self._clock() < end_time:
+            if end_time - self._clock() > 0.001:  # >1ms剩余时短暂释放
+                time.sleep(0.0001)  # 100μs级释放
+
+    def _high_precision_wait(self, cycle_start):
+        """混合精度周期控制"""
+        target_cycle = 1.0 / settings.TARGET_FREQUENCY
+        elapsed = self._clock() - cycle_start
+        remaining = max(0, target_cycle - elapsed)
+
+        if remaining > 0.002:  # >2ms
+            time.sleep(remaining * 0.8)  # 80%时间休眠
+            self._spin_wait(remaining * 0.2)  # 20%忙等待
+        else:  # ≤2ms
+            self._spin_wait(remaining)
+
+    def _spin_wait(self, duration):
+        """优化的忙等待"""
+        end = self._clock() + duration
+        while self._clock() < end:
             pass
+
+    def _record_cycle_anomaly(self, cycle_time):
+        """实时记录异常周期到独立文件"""
+        try:
+            cycle_ms = cycle_time * 1000
+            if cycle_ms > 20:  # 超过20ms记录
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+                # 获取简化调用栈
+                stack = []
+                for frame in traceback.extract_stack()[:-4]:  # 跳过最后4个内部帧
+                    if "site-packages" not in frame.filename:  # 过滤第三方库
+                        stack.append(f"{frame.filename}:{frame.lineno} ({frame.name})")
+
+                # 准备日志条目
+                stats = self.stats["周期统计"]
+                log_entry = (
+                        f"[{timestamp}] {cycle_ms:.3f}ms | "
+                        f"avg={stats['平均周期']:.3f}ms | "
+                        f"max={stats['最大周期']:.3f}ms | "
+                        f"jitter={stats['周期抖动']:.3f}ms\n"
+                        f"调用栈:\n  " + "\n  ".join(stack[-3:]) + "\n"
+                        f"{'-' * 40}\n"
+                )
+
+                # 实时写入文件并打印
+                with open(self.anomaly_log_path, "a", encoding="utf-8") as f:
+                    f.write(log_entry)
+
+                # 立即输出到控制台
+                print(f"\n! 周期异常 {cycle_ms:.1f}ms !", end="", flush=True)
+                return True
+        except Exception as e:
+            print(f"\n记录异常失败: {str(e)}", file=sys.stderr)
+        return False
 
     async def _random_operation(self, client):
         """执行随机Modbus操作（修正版）"""
@@ -273,6 +405,9 @@ class HighPrecisionAsyncModbusClient:
         cycle_ms = cycle_time * 1000
         self.stats["周期记录"].append(cycle_ms)
 
+        if cycle_ms > 20:
+            self._record_cycle_anomaly(cycle_time)
+
         cycles = self.stats["周期记录"]
         stats = self.stats["周期统计"]
         stats["平均周期"] = sum(cycles) / len(cycles)
@@ -285,36 +420,189 @@ class HighPrecisionAsyncModbusClient:
             variance = sum((x - mean)**2 for x in recent) / (len(recent)-1)
             stats["周期抖动"] = variance ** 0.5
 
+    def _print_cycle_stats(self):
+        """打印周期统计信息"""
+        stats = self.stats["周期统计"]
+        print(
+            f"\r--- 周期统计 --- "
+            f"平均周期: {stats['平均周期']:.6f}ms | "
+            f"最大周期: {stats['最大周期']:.6f}ms | "
+            f"最小周期: {stats['最小周期']:.6f}ms | "
+            f"周期抖动: {stats['周期抖动']:.6f}ms",
+            end=""
+        )
+        """连接预热方法"""
+    async def _warmup(self, connections):
+        logger.info("开始连接预热...")
+        warmup_start = self._clock()
+
+        # 预热期间不记录统计信息
+        while self._clock() < warmup_start + 1.0:  # 预热1秒
+            await asyncio.gather(*[
+                self._cycle_operation(conn, record_stats=False)
+                for conn in connections
+            ])
+
+        logger.success(f"预热完成，耗时 {(self._clock() - warmup_start) * 1000:.2f}ms")
+
+    async def _reconnect(self, old_conn):
+        """标准化的重连流程"""
+        try:
+            if old_conn:
+                await old_conn.close()
+            return await self.pool.get_connection()
+        except Exception as e:
+            logger.critical(f"重连失败: {e}")
+            raise ConnectionError("重连失败") from e
+
+    async def _safe_close_connections(self, connections):
+        """安全关闭连接集合"""
+        if not connections:
+            return
+
+        await asyncio.gather(
+            *[self._safe_close(c) for c in connections],
+            return_exceptions=True
+        )
+
+    async def _safe_close(self, client):
+        """安全关闭单个连接"""
+        if client is None:
+            return
+
+        try:
+            if hasattr(client, 'close'):
+                await asyncio.wait_for(client.close(), timeout=1.0)
+        except Exception as e:
+            logger.warning(f"关闭连接异常: {e}")
+
     async def run_test(self, duration):
-        """运行压力测试"""
-        logger.info("开始实时优化长连接压力测试...")
+        """多连接并行压力测试"""
+        logger.info(f"启动压力测试(连接数:{settings.CONNECTION_POOL_SIZE})...")
         end_time = self._clock() + duration
-        client = await self.pool.get_connection()
 
-        # 预热阶段
-        warmup_cycles = 10
-
-        while self._clock() < end_time:
-            cycle_start = self._clock()
-
+        # 初始化连接池并打印信息
+        connections = []
+        for i in range(settings.CONNECTION_POOL_SIZE):
             try:
-                # 减少并发数以提高稳定性
-                tasks = [self._random_operation(client) for _ in range(1)]  # 从5降到3
-                await asyncio.gather(*tasks)
+                conn = await self.pool.get_connection()
+                connections.append(conn)
+                logger.success(f"连接{i+1}建立 | {self._get_conn_info(conn)}")
             except Exception as e:
-                logger.error(f"测试异常: {e}")
-                client = await self.pool.get_connection()
+                logger.error(f"初始化连接{i+1}失败: {e}")
+                raise
 
-            # 精确周期控制(动态调整)
-            self._control_cycle_timing(cycle_start)
+        # 预热
+        await self._warmup(connections)
 
-            # 更新统计(跳过预热周期)
-            if warmup_cycles <= 0:
-                self._update_cycle_stats(self._clock() - cycle_start)
-            else:
-                warmup_cycles -= 1
+        # 主循环
+        try:
+            while self._clock() < end_time:
+                cycle_start = self._clock()
 
-        self._generate_report()
+                # 并行执行所有连接操作
+                results = await asyncio.gather(
+                    *[self._cycle_operation(conn) for conn in connections],
+                    return_exceptions=True
+                )
+
+                # 处理异常连接
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        logger.error(f"连接{i + 1}异常: {result}")
+                        connections[i] = await self._reconnect(connections[i])
+
+                # 精确周期控制
+                self._high_precision_wait(cycle_start)
+
+                # 打印状态
+                if len(self.stats["周期记录"]) % 100 == 0:
+                    self._print_cycle_stats()
+
+        finally:
+            await self._safe_close_connections(connections)
+            self._generate_report()
+
+    def _get_conn_info(self, client):
+        """安全获取连接信息"""
+        try:
+            if hasattr(client, 'params') and client.params:
+                return f"{client.params.host}:{client.params.port}"
+            return "unknown_connection"
+        except Exception:
+            return "connection_info_error"
+
+    async def _cycle_operation(self, client, record_stats=True):
+        """单连接周期操作"""
+        cycle_start = self._clock()
+        try:
+            async with asyncio.timeout(0.5):  # 500ms操作超时
+                await self._random_operation(client)
+
+            if record_stats:
+                cycle_time = self._clock() - cycle_start
+                self._update_cycle_stats(cycle_time)
+
+                # 记录异常周期
+                if cycle_time * 1000 > 20:
+                    self._record_anomaly(client, cycle_time)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"连接 {client.host}:{client.port} 操作超时")
+            raise
+        except Exception as e:
+            logger.warning(f"连接{client.host}:{client.port}操作失败: {str(e)}")
+            raise
+
+    def _record_anomaly(self, client, cycle_time):
+        """记录带连接信息的异常"""
+        log_entry = (
+            f"\n=== 连接异常 ===\n"
+            f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}\n"
+            f"连接: {client.host}:{client.port}\n"
+            f"异常周期: {cycle_time * 1000:.3f}ms\n"
+            f"Socket状态: {client.socket.getsockname()}\n"
+        )
+        with open("connection_anomalies.log", "a", encoding="utf-8") as f:
+            f.write(log_entry)
+
+    async def _graceful_shutdown(self, client):
+        """分阶段资源释放"""
+        try:
+            # 1. 取消所有待处理任务
+            pending = [t for t in asyncio.all_tasks()
+                       if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+            # 2. 关闭连接池
+            if hasattr(self.pool, 'close_all'):
+                await asyncio.wait_for(self.pool.close_all(), timeout=1.0)
+
+            # 3. 释放系统资源
+            if hasattr(self, '_winmm'):
+                self._winmm.timeEndPeriod(1)
+        except Exception as e:
+            logger.error(f"关闭过程中异常: {e}")
+
+    def _record_shutdown_anomaly(self, shutdown_time):
+        """记录关闭异常"""
+        anomaly_log = (
+            f"\n=== 关闭阶段异常 ===\n"
+            f"发生时间: {datetime.now().isoformat()}\n"
+            f"关闭耗时: {shutdown_time:.3f}ms\n"
+            f"当前统计:\n"
+            f"  测试周期数: {len(self.stats['周期记录'])}\n"
+            f"  平均周期: {self.stats['周期统计']['平均周期']:.3f}ms\n"
+            f"  最大周期: {self.stats['周期统计']['最大周期']:.3f}ms\n"
+            f"系统状态: {self._get_system_status()}\n"
+        )
+
+        os.makedirs("errors", exist_ok=True)
+        filename = f"shutdown_anomaly_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with open(f"errors/{filename}", 'w', encoding='utf-8') as f:
+            f.write(anomaly_log)
 
     def _generate_report(self):
         """生成包含延迟统计的详细报告"""
