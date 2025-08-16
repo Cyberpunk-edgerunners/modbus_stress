@@ -3,6 +3,7 @@ import asyncio
 from loguru import logger
 from pathlib import Path
 import sys
+from pymodbus import ModbusException
 
 # 修复导入路径（确保可以找到core模块）
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -15,7 +16,11 @@ async def modbus_stress_test(duration: int = 60):
         client = HighPrecisionAsyncModbusClient()
         logger.info("客户端初始化完成")
 
-        # 新版pymodbus连接测试方式
+        # 连接池健康检查
+        if not await client.pool.validate_pool_health():
+            raise RuntimeError("连接池初始化失败")
+
+        # pymodbus连接测试方式
         for attempt in range(3):
             try:
                 conn = await client.pool.get_connection()

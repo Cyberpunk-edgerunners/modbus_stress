@@ -14,10 +14,12 @@ CLIENT_BASE_PORT = 10000  # 客户端起始端口
 
 
 # 连接池配置
-CONNECTION_POOL_SIZE = 4
+CONNECTION_POOL_SIZE = 2
 CONNECT_TIMEOUT = 5.0
 CONNECT_RETRIES = 3
 RESPONSE_TIMEOUT = 3.0  # 响应超时
+MONITOR_INTERVAL = 5  # 连接监控间隔(秒)
+
 
 # 测试配置
 TEST_DURATION = timedelta(hours=0.001).total_seconds()

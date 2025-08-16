@@ -7,13 +7,13 @@ import asyncio
 from datetime import datetime
 from loguru import logger
 from pymodbus.exceptions import ModbusException
-from .async_connection import AsyncModbusConnection
 from config import settings
 from pathlib import Path
 import win32api
 import win32con
 import win32process
 import traceback
+from .realtime_async_connection import AsyncModbusConnection
 
 #Windows API 常量定义
 PROCESS_ALL_ACCESS = 0x1F0FFF
@@ -33,21 +33,23 @@ class HighPrecisionAsyncModbusClient:
         self._init_clock()
         self._init_realtime()
         self._stats_init()
-        # self._setup_logging()
 
-        self.errors_dir = Path("errors")
-        self.errors_dir.mkdir(exist_ok=True)
+        self._stats_lock = asyncio.Lock()
 
-        # 初始化异常日志文件
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.anomaly_log_path = self.errors_dir / f"cycle_anomalies_{timestamp}.log"
-
-        # 写入日志头
-        with open(self.anomaly_log_path, "w", encoding="utf-8") as f:
-            f.write("=== 周期异常日志 ===\n")
-            f.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("格式: [时间戳] 周期(ms) | 平均周期 | 最大周期 | 抖动 | 调用栈\n")
-            f.write("-" * 80 + "\n")
+        """查找异常报文的日志(暂注)"""
+        # self.errors_dir = Path("errors")
+        # self.errors_dir.mkdir(exist_ok=True)
+        #
+        # # 初始化异常日志文件
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # self.anomaly_log_path = self.errors_dir / f"cycle_anomalies_{timestamp}.log"
+        #
+        # # 写入日志头
+        # with open(self.anomaly_log_path, "w", encoding="utf-8") as f:
+        #     f.write("=== 周期异常日志 ===\n")
+        #     f.write(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        #     f.write("格式: [时间戳] 周期(ms) | 平均周期 | 最大周期 | 抖动 | 调用栈\n")
+        #     f.write("-" * 80 + "\n")
 
 
     def _stats_init(self):
@@ -79,6 +81,8 @@ class HighPrecisionAsyncModbusClient:
             }
         }
 
+        self.conn_stats = {}
+
     def _init_clock(self):
         """初始化高精度时钟源"""
         if hasattr(time, 'perf_counter'):
@@ -89,11 +93,13 @@ class HighPrecisionAsyncModbusClient:
             self._kernel32.QueryPerformanceFrequency(ctypes.byref(self._qpc_freq))
             self._clock = self._qpc_counter
 
+
     def _qpc_counter(self):
         """Windows高精度计时器"""
         counter = ctypes.c_int64()
         self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
         return counter.value / self._qpc_freq.value
+
 
     def _init_realtime(self):
         """Windows实时环境初始化"""
@@ -126,8 +132,9 @@ class HighPrecisionAsyncModbusClient:
             except Exception as e:
                 logger.error(f"CPU绑定失败: {e}")
 
+
     def _set_process_priority(self, priority_class):
-        """安全的进程优先级设置"""
+        """进程优先级设置"""
         try:
             # 正确获取当前进程ID
             pid = win32api.GetCurrentProcessId()
@@ -150,6 +157,7 @@ class HighPrecisionAsyncModbusClient:
             logger.error(f"优先级设置失败: {e}")
             raise RuntimeError("进程优先级设置失败") from e
 
+
     def _priority_name(self, class_code):
         """将优先级代码转为可读名称"""
         return {
@@ -158,9 +166,9 @@ class HighPrecisionAsyncModbusClient:
             win32con.NORMAL_PRIORITY_CLASS: "正常"
         }.get(class_code, f"未知({class_code:#x})")
 
-    def _set_thread_priority(self, priority_level=THREAD_PRIORITY_TIME_CRITICAL):
-        # 设置当前线程优先级
 
+    def _set_thread_priority(self, priority_level=THREAD_PRIORITY_TIME_CRITICAL):
+        """设置当前线程优先级"""
         try:
             # 使用 win32api 替代 ctypes 直接调用
             thread_handle = win32api.GetCurrentThread()
@@ -182,6 +190,7 @@ class HighPrecisionAsyncModbusClient:
         }.get(priority_level, f"未知({priority_level})")
 
     def _set_cpu_affinity(self, core_id):
+        """设置CPU亲和性"""
         try:
             pid = win32api.GetCurrentProcessId()
             hProcess = win32api.OpenProcess(
@@ -405,8 +414,9 @@ class HighPrecisionAsyncModbusClient:
         cycle_ms = cycle_time * 1000
         self.stats["周期记录"].append(cycle_ms)
 
-        if cycle_ms > 20:
-            self._record_cycle_anomaly(cycle_time)
+        # 统计异常周期(暂注)
+        # if cycle_ms > 20:
+        #     self._record_cycle_anomaly(cycle_time)
 
         cycles = self.stats["周期记录"]
         stats = self.stats["周期统计"]
@@ -432,6 +442,7 @@ class HighPrecisionAsyncModbusClient:
             end=""
         )
         """连接预热方法"""
+
     async def _warmup(self, connections):
         logger.info("开始连接预热...")
         warmup_start = self._clock()
@@ -446,14 +457,29 @@ class HighPrecisionAsyncModbusClient:
         logger.success(f"预热完成，耗时 {(self._clock() - warmup_start) * 1000:.2f}ms")
 
     async def _reconnect(self, old_conn):
-        """标准化的重连流程"""
+        """增强版重连逻辑"""
         try:
-            if old_conn:
-                await old_conn.close()
-            return await self.pool.get_connection()
+            # 安全关闭旧连接
+            if old_conn is not None:
+                try:
+                    if hasattr(old_conn, 'close'):
+                        await asyncio.wait_for(old_conn.close(), timeout=1.0)
+                except Exception as e:
+                    logger.warning(f"关闭旧连接异常: {e}")
+
+            # 创建新连接
+            new_conn = await self.pool.get_connection()
+
+            # 验证连接有效性
+            if not hasattr(new_conn, 'host') or not new_conn.connected:
+                raise ConnectionError("新连接无效")
+
+            return new_conn
+
         except Exception as e:
             logger.critical(f"重连失败: {e}")
-            raise ConnectionError("重连失败") from e
+            await asyncio.sleep(1)  # 避免快速重试
+            raise ConnectionError(f"重连失败: {e}") from e
 
     async def _safe_close_connections(self, connections):
         """安全关闭连接集合"""
@@ -475,6 +501,36 @@ class HighPrecisionAsyncModbusClient:
                 await asyncio.wait_for(client.close(), timeout=1.0)
         except Exception as e:
             logger.warning(f"关闭连接异常: {e}")
+
+    def _update_conn_stats(self, conn_name, cycle_time, success):
+        """更新连接级统计"""
+        if conn_name not in self.conn_stats:
+            self.conn_stats[conn_name] = {
+                "total": 0,
+                "success": 0,
+                "cycles": [],
+                "last_active": self._clock()
+            }
+
+        stats = self.conn_stats[conn_name]
+        stats["total"] += 1
+        stats["success"] += int(success)
+        stats["cycles"].append(cycle_time)
+        stats["last_active"] = self._clock()
+
+    async def _connection_cycle(self, conn, conn_name):
+        """单个连接的完整工作周期"""
+        try:
+            async with self._stats_lock:
+                start_time = self._clock()
+                # 执行Modbus操作
+                success = await self._random_operation(conn)
+                cycle_time = self._clock() - start_time
+                self._update_conn_stats(conn_name, cycle_time, success)
+
+        except Exception as e:
+            logger.error(f"{conn_name} 操作失败: {e}")
+            raise
 
     async def run_test(self, duration):
         """多连接并行压力测试"""
@@ -500,17 +556,17 @@ class HighPrecisionAsyncModbusClient:
             while self._clock() < end_time:
                 cycle_start = self._clock()
 
-                # 并行执行所有连接操作
-                results = await asyncio.gather(
-                    *[self._cycle_operation(conn) for conn in connections],
-                    return_exceptions=True
-                )
+                # 为每个连接创建独立任务
+                tasks = []
+                for i, conn in enumerate(connections):
+                    task = asyncio.create_task(
+                        self._connection_cycle(conn, f"conn_{i + 1}"),
+                        name=f"modbus_worker_{i}"
+                    )
+                    tasks.append(task)
 
-                # 处理异常连接
-                for i, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.error(f"连接{i + 1}异常: {result}")
-                        connections[i] = await self._reconnect(connections[i])
+                # 等待所有连接完成本轮操作
+                await asyncio.gather(*tasks)
 
                 # 精确周期控制
                 self._high_precision_wait(cycle_start)
@@ -524,10 +580,10 @@ class HighPrecisionAsyncModbusClient:
             self._generate_report()
 
     def _get_conn_info(self, client):
-        """安全获取连接信息"""
+        """获取连接信息"""
         try:
-            if hasattr(client, 'params') and client.params:
-                return f"{client.params.host}:{client.params.port}"
+            if hasattr(client, 'comm_params'):
+                return f"{client.comm_params.host}:{client.comm_params.port}"
             return "unknown_connection"
         except Exception:
             return "connection_info_error"
@@ -565,44 +621,6 @@ class HighPrecisionAsyncModbusClient:
         )
         with open("connection_anomalies.log", "a", encoding="utf-8") as f:
             f.write(log_entry)
-
-    async def _graceful_shutdown(self, client):
-        """分阶段资源释放"""
-        try:
-            # 1. 取消所有待处理任务
-            pending = [t for t in asyncio.all_tasks()
-                       if t is not asyncio.current_task()]
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-
-            # 2. 关闭连接池
-            if hasattr(self.pool, 'close_all'):
-                await asyncio.wait_for(self.pool.close_all(), timeout=1.0)
-
-            # 3. 释放系统资源
-            if hasattr(self, '_winmm'):
-                self._winmm.timeEndPeriod(1)
-        except Exception as e:
-            logger.error(f"关闭过程中异常: {e}")
-
-    def _record_shutdown_anomaly(self, shutdown_time):
-        """记录关闭异常"""
-        anomaly_log = (
-            f"\n=== 关闭阶段异常 ===\n"
-            f"发生时间: {datetime.now().isoformat()}\n"
-            f"关闭耗时: {shutdown_time:.3f}ms\n"
-            f"当前统计:\n"
-            f"  测试周期数: {len(self.stats['周期记录'])}\n"
-            f"  平均周期: {self.stats['周期统计']['平均周期']:.3f}ms\n"
-            f"  最大周期: {self.stats['周期统计']['最大周期']:.3f}ms\n"
-            f"系统状态: {self._get_system_status()}\n"
-        )
-
-        os.makedirs("errors", exist_ok=True)
-        filename = f"shutdown_anomaly_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        with open(f"errors/{filename}", 'w', encoding='utf-8') as f:
-            f.write(anomaly_log)
 
     def _generate_report(self):
         """生成包含延迟统计的详细报告"""
@@ -684,8 +702,8 @@ class HighPrecisionAsyncModbusClient:
             finally:
                 self._winmm = None
 
-        # 3. 关闭连接池（带超时保护）
-        if hasattr(self, 'pool'):
+        # 3. 关闭连接池
+        if hasattr(self, 'pool') and self.pool:
             try:
                 # 添加超时保护
                 await asyncio.wait_for(self.pool.close_all(), timeout=5.0)

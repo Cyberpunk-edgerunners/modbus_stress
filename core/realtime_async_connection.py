@@ -1,4 +1,5 @@
 import asyncio
+import time
 import socket
 import ctypes
 import sys
@@ -41,105 +42,218 @@ class AsyncModbusConnection:
             logger.error(f"实时初始化失败: {e}")
 
     async def initialize(self):
-        """初始化连接池"""
+        """连接池初始化"""
         if not self._initialized:
             async with self._lock:
                 if not self._initialized:
-                    # 预创建所有连接
-                    self._connections = await asyncio.gather(
-                        *[self._create_connection(i)
-                          for i in range(settings.CONNECTION_POOL_SIZE)],
-                        return_exceptions=True
-                    )
+                    self._connections = []
+                    success_count = 0
 
-                    # 启动连接监控
+                    # 逐个创建连接，明确处理结果
+                    for i in range(settings.CONNECTION_POOL_SIZE):
+                        try:
+                            conn = await self._create_connection(i)
+                            if conn and conn.connected:
+                                self._connections.append(conn)
+                                success_count += 1
+                                logger.success(f"连接{i}初始化成功")
+                            else:
+                                self._connections.append(None)
+                                logger.warning(f"连接{i}创建后状态异常")
+                        except Exception as e:
+                            self._connections.append(None)  # 确保填充None
+                            logger.error(f"连接{i}初始化失败: {str(e)}", exc_info=True)
+
+                    # 关键验证
+                    if success_count == 0:
+                        raise RuntimeError("所有连接初始化失败")
+
                     self._monitor_task = asyncio.create_task(self._monitor_connections())
                     self._initialized = True
-                    logger.info(f"连接池初始化完成，大小: {settings.CONNECTION_POOL_SIZE}")
+                    logger.success(
+                        f"连接池就绪 | 总计: {settings.CONNECTION_POOL_SIZE} | "
+                        f"可用: {success_count}"
+                    )
 
     async def _create_connection(self, conn_id):
-        """创建带实时优化的连接"""
+        """创建带实时优化的异步连接"""
         client = None
         try:
-            # 每个连接使用不同本地端口
-            local_port = settings.CLIENT_BASE_PORT + conn_id if hasattr(settings, 'CLIENT_BASE_PORT') else 0
+            # 基础连接参数
+            client_params = {
+                'host': settings.CONTROLLER_IP,
+                'port': settings.CONTROLLER_PORT,
+                'timeout': settings.RESPONSE_TIMEOUT,
+                'retries': settings.CONNECT_RETRIES,
+            }
 
-            client = AsyncModbusTcpClient(
-                host=settings.CONTROLLER_IP,
-                port=settings.CONTROLLER_PORT,
-                timeout=settings.RESPONSE_TIMEOUT,
-                retries=settings.CONNECT_RETRIES,
-                local_port=local_port,
-                socket_options=[
-                    (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
-                    (socket.SOL_SOCKET, socket.SO_LINGER, 0),
-                    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                ]
-            )
+            # 设置本地绑定端口
+            if hasattr(settings, 'CLIENT_BASE_PORT'):
+                client_params['source_address'] = (
+                    '0.0.0.0',
+                    settings.CLIENT_BASE_PORT + conn_id
+                )
 
-            # 带超时和重试的连接
+            # 创建客户端实例
+            client = AsyncModbusTcpClient(**client_params)
+            logger.debug(f"连接{conn_id}客户端创建成功")
+
+            # === 正确的异步连接流程 ===
+            connected = False
             for attempt in range(1, settings.CONNECT_RETRIES + 1):
                 try:
-                    await asyncio.wait_for(
-                        client.connect(),
-                        timeout=settings.CONNECT_TIMEOUT
-                    )
+                    logger.debug(f"连接{conn_id}异步尝试#{attempt}...")
+
+                    # 异步连接（必须await）
+                    await client.connect()
+
+                    # 验证连接状态
                     if client.connected:
-                        logger.debug(f"连接{conn_id}建立成功")
-                        return client
-                    raise ConnectionError("连接状态异常")
-                except (asyncio.TimeoutError, ModbusException) as e:
-                    if attempt == settings.CONNECT_RETRIES:
-                        raise
-                    await asyncio.sleep(1)
+                        connected = True
+                        logger.success(f"连接{conn_id}建立成功")
+                        break
+                    else:
+                        logger.warning(f"连接{conn_id}状态异常")
+                        await asyncio.sleep(0.5)  # 异步等待
+
+                except Exception as e:
+                    logger.warning(f"连接{conn_id}尝试#{attempt}失败: {str(e)}")
+                    await asyncio.sleep(1)  # 异步等待
+
+            if not connected:
+                raise ConnectionError(f"连接{conn_id}无法建立")
+
+            # 打印连接详情
+            logger.success(
+                f"连接{conn_id}已就绪 | "
+                f"本地端口: {client.comm_params.source_address[1]} | "
+                f"远端: {client.comm_params.host}:{client.comm_params.port}"
+            )
+            return client
 
         except Exception as e:
-            if client:
-                await client.close()
-            logger.error(f"创建连接{conn_id}失败: {e}")
+            if client is not None:
+                await client.close()  # 异步关闭
+            logger.error(f"创建连接{conn_id}失败: {str(e)}", exc_info=True)
             raise
 
     async def get_connection(self, conn_id=None):
         """获取连接(支持指定连接ID或轮询获取)"""
-        await self.initialize()
+        # 确保连接池已初始化
+        if not self._initialized:
+            await self.initialize()
 
         async with self._lock:
-            # 如果指定了conn_id且有效
-            if conn_id is not None and 0 <= conn_id < len(self._connections):
-                conn = self._connections[conn_id]
-                if conn is None or not getattr(conn, 'connected', False):
-                    self._connections[conn_id] = await self._create_connection(conn_id)
-                return self._connections[conn_id]
+            # 优先处理指定连接ID
+            if conn_id is not None:
+                if 0 <= conn_id < len(self._connections):
+                    conn = self._connections[conn_id]
+                    # 修复无效连接
+                    if conn is None or not getattr(conn, 'connected', False):
+                        try:
+                            self._connections[conn_id] = await self._safe_create_connection(conn_id)
+                            conn = self._connections[conn_id]
+                        except Exception as e:
+                            logger.error(f"连接{conn_id}修复失败: {str(e)}")
+                            raise ConnectionError(f"连接{conn_id}不可用") from e
+                    return conn
+                raise IndexError(f"无效连接ID: {conn_id}")
 
-            # 轮询获取第一个可用连接
+            # 自动分配模式：优先返回有效连接
             for i, conn in enumerate(self._connections):
-                if conn is not None and getattr(conn, 'connected', False):
+                if conn and getattr(conn, 'connected', False):
                     return conn
 
-            # 无可用连接时创建新连接
-            if len(self._connections) < settings.CONNECTION_POOL_SIZE:
-                new_conn = await self._create_connection(len(self._connections))
-                self._connections.append(new_conn)
-                return new_conn
+            # 尝试修复失效连接（第一次修复尝试）
+            for i, conn in enumerate(self._connections):
+                if conn is None or not getattr(conn, 'connected', False):
+                    try:
+                        self._connections[i] = await self._safe_create_connection(i)
+                        if self._connections[i] and self._connections[i].connected:
+                            return self._connections[i]
+                    except:
+                        pass  # 首次修复失败暂不处理
 
-            raise ConnectionError("连接池已满且无可用连接")
+            # 终极验证：连接池真满还是假满
+            active_conns = [c for c in self._connections if c and getattr(c, 'connected', False)]
+            if active_conns:
+                return active_conns[0]  # 返回首个可用连接
+
+            raise ConnectionError("连接池无可用连接")
 
     async def _monitor_connections(self):
-        """连接健康监控"""
+        """鲁棒的连接监控"""
+        logger.info("连接监控任务启动")
         while True:
-            await asyncio.sleep(2)  # 每2秒检查一次
+            try:
+                await asyncio.sleep(settings.MONITOR_INTERVAL)
 
-            async with self._lock:
-                for i, conn in enumerate(self._connections):
-                    if conn is None:
-                        continue
+                async with self._lock:
+                    for i, conn in enumerate(self._connections):
+                        try:
+                            # 处理未初始化连接
+                            if conn is None:
+                                logger.warning(f"连接{i}未初始化，尝试创建...")
+                                self._connections[i] = await self._safe_create_connection(i)
+                                continue
 
-                    try:
-                        if not getattr(conn, 'connected', False):
-                            logger.warning(f"连接{i}断开，尝试重连...")
-                            self._connections[i] = await self._create_connection(i)
-                    except Exception as e:
-                        logger.error(f"连接{i}监控异常: {e}")
+                            # 检查连接活性
+                            if not await self._check_connection_active(conn):
+                                logger.warning(f"连接{i}失效，重建中...")
+                                await conn.close()
+                                self._connections[i] = await self._safe_create_connection(i)
+
+                        except Exception as e:
+                            logger.error(f"连接{i}监控异常: {str(e)}", exc_info=True)
+                            # 确保位置标记为无效
+                            self._connections[i] = None
+
+            except asyncio.CancelledError:
+                logger.info("连接监控任务正常终止")
+                break
+            except Exception as e:
+                logger.critical(f"监控任务崩溃: {str(e)}", exc_info=True)
+                await asyncio.sleep(5)  # 防止错误风暴
+
+    async def _check_connection_active(self, conn):
+        """深度连接活性检测"""
+        if not conn or not getattr(conn, 'connected', False):
+            return False
+
+        try:
+            # 发送心跳请求验证
+            rr = await asyncio.wait_for(
+                conn.read_holding_registers(0, 1),
+                timeout=1.0
+            )
+            return not rr.isError()
+        except Exception:
+            return False
+
+    async def _safe_create_connection(self, conn_id):
+        """带异常隔离的连接创建"""
+        try:
+            return await self._create_connection(conn_id)
+        except Exception as e:
+            logger.error(f"创建连接{conn_id}失败: {str(e)}", exc_info=True)
+            return None  # 确保返回可控值
+
+    async def validate_pool_health(self):
+        """连接池健康诊断"""
+        if not self._initialized:
+            await self.initialize()
+
+        active_count = 0
+        for i, conn in enumerate(self._connections):
+            if conn and getattr(conn, 'connected', False):
+                active_count += 1
+            elif conn is None:
+                logger.warning(f"连接{i}未初始化")
+            else:
+                logger.error(f"连接{i}状态异常")
+
+        logger.info(f"连接池健康检查: {active_count}/{len(self._connections)} 活跃")
+        return active_count > 0  # 至少一个有效连接
 
     async def close_all(self):
         """安全关闭所有连接"""

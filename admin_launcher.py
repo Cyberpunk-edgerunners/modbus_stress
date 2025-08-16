@@ -3,6 +3,7 @@ import ctypes
 import asyncio
 from pathlib import Path
 from loguru import logger
+from tests.test_case4 import modbus_stress_test
 
 
 def is_admin():
@@ -52,7 +53,6 @@ def elevate_restart():
 
 
 async def main():
-    from tests.test_case4 import modbus_stress_test
     success = await modbus_stress_test(duration=600)
     if not success:
         raise RuntimeError("Modbus测试失败")
