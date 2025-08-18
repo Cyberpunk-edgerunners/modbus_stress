@@ -68,7 +68,11 @@ class AsyncModbusConnection:
                     if success_count == 0:
                         raise RuntimeError("所有连接初始化失败")
 
-                    self._monitor_task = asyncio.create_task(self._monitor_connections())
+                    if settings.MONITOR_INTERVAL > 0:
+                        self._monitor_task = asyncio.create_task(self._monitor_connections())
+                    else:
+                        logger.info("连接监控已禁用")
+
                     self._initialized = True
                     logger.success(
                         f"连接池就绪 | 总计: {settings.CONNECTION_POOL_SIZE} | "
