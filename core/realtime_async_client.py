@@ -24,8 +24,6 @@ THREAD_PRIORITY_TIME_CRITICAL = 15
 THREAD_PRIORITY_HIGHEST = 2
 THREAD_PRIORITY_NORMAL = 0
 
-MAX_CYCLE_THRESHOLD = 0.020  # 20ms阈值
-
 class HighPrecisionAsyncModbusClient:
     """异步Modbus客户端(Windows环境实时)"""
     def __init__(self, master_ids):
@@ -35,12 +33,14 @@ class HighPrecisionAsyncModbusClient:
         self._init_realtime()
         self.client_stats = {}
         self.stats_lock = asyncio.Lock()
+        self.last_send_times = {}  # 记录每个客户端上一次发送时间
 
         # 为每个客户端初始化统计
         for master_id in master_ids:
             self._init_client_stats(master_id)
+            self.last_send_times[master_id] = self._clock()  # 初始化发送时间
 
-        # 初始化全局统计（用于清理等操作）
+        # 初始化全局统计
         self.global_stats = {
             "start_time": self._clock(),
             "total_requests": 0,
@@ -55,13 +55,13 @@ class HighPrecisionAsyncModbusClient:
             "成功请求": 0,
             "失败请求": 0,
             "开始时间": self._clock(),
-            "周期记录": [],
-            "延迟记录": [],
-            "周期统计": {
-                "平均周期": 0.0,
-                "最大周期": 0.0,
-                "最小周期": float('inf'),
-                "周期抖动": 0.0
+            "发送间隔记录": [],  # 添加发送间隔记录
+            "报文延迟记录": [],
+            "间隔统计": {  # 添加间隔统计字段
+                "平均间隔": 0.0,
+                "最大间隔": 0.0,
+                "最小间隔": float('inf'),
+                "间隔抖动": 0.0
             },
             "报文延迟统计": {
                 "read_input_registers": [],
@@ -293,6 +293,17 @@ class HighPrecisionAsyncModbusClient:
 
     async def _random_operation(self, client, master_id):
         """执行随机Modbus操作（修正版）"""
+        # 记录发送间隔开始
+        send_start = self._clock()
+
+        # 计算真实发送间隔
+        if master_id in self.last_send_times:
+            interval = (send_start - self.last_send_times[master_id]) * 1000  # ms
+            async with self.stats_lock:
+                stats = self.client_stats[master_id]
+                stats["发送间隔记录"].append(interval)
+        self.last_send_times[master_id] = send_start
+
         op_type = random.randint(0, 2)
         addr = random.randint(*settings.HOLDING_REGISTER_RANGE)
         count = min(random.randint(1, 10), settings.MAX_REGISTERS_PER_READ)
@@ -388,38 +399,48 @@ class HighPrecisionAsyncModbusClient:
                 avg = sum(latencies) / len(latencies)
                 self.stats["报文延迟统计"][f"{op_type}_平均"] = avg
 
-    def _update_cycle_stats(self, cycle_time):
-        """更新周期统计数据"""
-        cycle_ms = cycle_time * 1000
-        self.stats["周期记录"].append(cycle_ms)
+    def _update_client_interval_stats(self, master_id):
+        """更新单个客户端的周期统计信息"""
+        stats = self.client_stats[master_id]
+        intervals = stats["发送间隔记录"]
+        if not intervals:
+            return
 
-        # 统计异常周期(暂注)
-        # if cycle_ms > 20:
-        #     self._record_cycle_anomaly(cycle_time)
+        interval_stats = stats["间隔统计"]
+        interval_stats["平均间隔"] = sum(intervals) / len(intervals)
+        interval_stats["最大间隔"] = max(intervals)
+        interval_stats["最小间隔"] = min(intervals)
 
-        cycles = self.stats["周期记录"]
-        stats = self.stats["周期统计"]
-        stats["平均周期"] = sum(cycles) / len(cycles)
-        stats["最大周期"] = max(cycles)
-        stats["最小周期"] = min(cycles)
+        # 计算抖动（标准差）
+        if len(intervals) > 1:
+            mean = interval_stats["平均间隔"]
+            variance = sum((x - mean) ** 2 for x in intervals) / (len(intervals) - 1)
+            interval_stats["间隔抖动"] = variance ** 0.5
+        else:
+            interval_stats["间隔抖动"] = 0.0
 
-        recent = cycles[-100:] if len(cycles) >= 100 else cycles
-        if len(recent) > 1:
-            mean = sum(recent) / len(recent)
-            variance = sum((x - mean)**2 for x in recent) / (len(recent)-1)
-            stats["周期抖动"] = variance ** 0.5
+    def _get_client_interval_stats_str(self, master_id):
+        """获取单个客户端的周期统计字符串"""
+        self._update_client_interval_stats(master_id)
+        stats = self.client_stats[master_id]["间隔统计"]
 
-    def _print_client_cycle_stats(self, master_id):
-        """打印单个客户端的周期统计"""
-        stats = self.client_stats[master_id]["周期统计"]
-        print(
-            f"\r[客户端 {master_id}] "
-            f"平均周期: {stats['平均周期']:.3f}ms | "
-            f"最大周期: {stats['最大周期']:.3f}ms | "
-            f"抖动: {stats['周期抖动']:.3f}ms",
-            end=""
-        )
+        formatted_avg = f"{stats['平均间隔']:.3f}".rjust(6)
+        formatted_max = f"{stats['最大间隔']:.3f}".rjust(6)
+        formatted_jitter = f"{stats['间隔抖动']:.3f}".rjust(6)
 
+        return f"[客户端 {master_id}] 平均间隔: {formatted_avg}ms | 最大间隔: {formatted_max}ms | 抖动: {formatted_jitter}ms"
+
+    def print_all_client_interval_stats(self):
+        """打印所有客户端的周期统计信息"""
+        # 清屏或移动光标到行首
+        print("\033[F" * (len(self.master_ids) + 1), end="")  # 移动光标到上一行
+
+        # 打印所有客户端统计
+        for master_id in self.master_ids:
+            print(self._get_client_interval_stats_str(master_id))
+
+        # 添加空行使输出更清晰
+        print("")
 
     # async def _warmup(self, connections):
     #     """连接预热方法"""
@@ -481,21 +502,6 @@ class HighPrecisionAsyncModbusClient:
         except Exception as e:
             logger.warning(f"关闭连接异常: {e}")
 
-    def _update_conn_stats(self, conn_name, cycle_time, success):
-        """更新连接级统计"""
-        if conn_name not in self.conn_stats:
-            self.conn_stats[conn_name] = {
-                "total": 0,
-                "success": 0,
-                "cycles": [],
-                "last_active": self._clock()
-            }
-
-        stats = self.conn_stats[conn_name]
-        stats["total"] += 1
-        stats["success"] += int(success)
-        stats["cycles"].append(cycle_time)
-        stats["last_active"] = self._clock()
 
     async def _connection_cycle(self, conn, master_id):
         """重构：客户端独立周期操作"""
@@ -503,16 +509,17 @@ class HighPrecisionAsyncModbusClient:
             stats = self.client_stats[master_id]
             cycle_start = self._clock()
 
-            # 执行Modbus操作
-            success = await self._random_operation(conn, master_id)
+            await self._random_operation(conn, master_id)
 
-            # 更新周期统计
-            cycle_time = self._clock() - cycle_start
-            stats["周期记录"].append(cycle_time)
+            # 计算真实周期时间（操作时间）
+            operation_time = self._clock() - cycle_start
 
-            # 打印周期波动
-            if len(stats["周期记录"]) % 100 == 0:
-                self._print_client_cycle_stats(master_id)
+            # # 更新周期统计
+            # self._update_client_cycle_stats(master_id, operation_time)
+
+            # # 打印周期波动
+            # if len(stats["周期记录"]) % 10 == 0:
+            #     self._print_client_cycle_stats(master_id)
 
         except Exception as e:
             logger.error(f"客户端 [{master_id}] 操作失败: {e}")
@@ -542,28 +549,47 @@ class HighPrecisionAsyncModbusClient:
             config = settings.MASTER_CONFIGS.get(master_id, {})
             cycles[master_id] = config.get("cycle_time") or 1.0 / settings.TARGET_FREQUENCY
 
+        # 打印初始统计信息
+        print("\n" * len(self.master_ids))  # 预留空间
+
         # 主循环
         try:
+            iteration_count = 0
             while self._clock() < end_time:
+                iteration_count += 1
                 tasks = []
-                for master_id, conn in connections.items():
-                    cycle_start = self._clock()
+                # cycle_starts = {}   # 记录每个客户端的开始时间
 
-                    # 为每个客户端创建任务
+                # 启动所有客户端的任务
+                for master_id, conn in connections.items():
+                    # cycle_starts[master_id] = self._clock()
                     task = asyncio.create_task(
                         self._connection_cycle(conn, master_id),
                         name=f"modbus_worker_{master_id}"
                     )
                     tasks.append(task)
 
-                    # 等待下一个周期（客户端独立控制）
-                    remaining = cycles[master_id] - (self._clock() - cycle_start)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-
                 # 等待所有任务完成
                 await asyncio.gather(*tasks)
 
+                # 每10次迭代打印一次所有客户端统计
+                if iteration_count % 10 == 0:
+                    self.print_all_client_interval_stats()
+
+                # # 精确控制每个客户端的周期
+                # for master_id in connections:
+                #     elapsed = self._clock() - cycle_starts[master_id]
+                #     remaining = max(0, cycles[master_id] - elapsed)
+                #     if remaining > 0:
+                #         await asyncio.sleep(remaining)
+                # 简单等待，确保所有客户端有机会发送
+                await asyncio.sleep(0.001)
+
+
+        except asyncio.CancelledError:
+            logger.info("测试被取消")
+        except Exception as e:
+            logger.error(f"测试运行失败: {e}")
         finally:
             await self._safe_close_connections(list(connections.values()))
             self._generate_report()
@@ -657,10 +683,15 @@ class HighPrecisionAsyncModbusClient:
             client_duration = self._clock() - stats["开始时间"]
             client_qps = stats["总请求数"] / client_duration if client_duration > 0 else 0
 
+            # 修复配置问题：确保周期配置不为None
+            cycle_time = config.get("cycle_time")
+            if cycle_time is None:
+                cycle_time = 1.0 / settings.TARGET_FREQUENCY
+
             report_lines.extend([
                 f"\n--- 客户端 [{master_id}] ---",
                 f"描述: {config.get('description', '无描述')}",
-                f"设定周期: {config.get('cycle_time', 1.0 / settings.TARGET_FREQUENCY) * 1000:.3f}ms",
+                f"设定周期: {cycle_time * 1000:.3f}ms",  # 使用修复后的值
                 f"运行时长: {client_duration:.2f}秒",
                 f"总请求数: {stats['总请求数']}",
                 f"成功请求: {stats['成功请求']}",
@@ -668,11 +699,11 @@ class HighPrecisionAsyncModbusClient:
                 f"QPS: {client_qps:.2f}",
                 f"成功率: {(stats['成功请求'] / stats['总请求数'] * 100) if stats['总请求数'] > 0 else 0:.2f}%",
                 "",
-                "周期统计:",
-                f"  平均周期: {stats['周期统计']['平均周期']:.6f}ms",
-                f"  最大周期: {stats['周期统计']['最大周期']:.6f}ms",
-                f"  最小周期: {stats['周期统计']['最小周期']:.6f}ms",
-                f"  周期抖动: {stats['周期统计']['周期抖动']:.6f}ms",
+                "间隔统计:",
+                f"  平均间隔: {stats['间隔统计']['平均间隔']:.6f}ms",
+                f"  最大间隔: {stats['间隔统计']['最大间隔']:.6f}ms",
+                f"  最小间隔: {stats['间隔统计']['最小间隔']:.6f}ms",
+                f"  间隔抖动: {stats['间隔统计']['间隔抖动']:.6f}ms",
                 "",
                 "报文延迟统计:",
             ])
