@@ -260,28 +260,50 @@ class AsyncModbusConnection:
         return active_count > 0  # 至少一个有效连接
 
     async def close_all(self):
-        """安全关闭所有连接"""
+        """安全关闭所有连接 - 修复无效await问题"""
+        # 1. 取消监控任务
         if self._monitor_task:
             self._monitor_task.cancel()
             try:
                 await self._monitor_task
             except asyncio.CancelledError:
                 pass
+            except Exception:
+                pass  # 忽略其他异常
 
-        async with self._lock:
-            close_tasks = []
-            for conn in self._connections:
-                if conn and hasattr(conn, 'close'):
-                    close_tasks.append(conn.close())
+        # 2. 安全关闭所有连接
+        close_tasks = []
+        for conn in self._connections:
+            if conn and hasattr(conn, 'close'):
+                try:
+                    # 仅当close是协程函数时才await
+                    if asyncio.iscoroutinefunction(conn.close):
+                        close_tasks.append(conn.close())
+                    else:
+                        # 同步方法在后台执行
+                        loop = asyncio.get_running_loop()
+                        close_tasks.append(loop.run_in_executor(None, conn.close))
+                except Exception:
+                    pass  # 忽略单个连接关闭异常
 
+        # 3. 等待所有关闭操作完成
+        if close_tasks:
             await asyncio.gather(*close_tasks, return_exceptions=True)
 
-            if hasattr(self, '_winmm'):
+        # 4. Windows特定清理
+        if sys.platform == "win32" and hasattr(self, '_winmm'):
+            try:
                 self._winmm.timeEndPeriod(1)
+            except Exception:
+                pass
 
-            self._connections = []
-            self._initialized = False
-            logger.info("所有连接已关闭")
+        # 5. 重置状态
+        self._connections = []
+        self._initialized = False
+        logger.info("所有连接已关闭")
+
+        # 返回None避免无效await
+        return None
 
     async def __aenter__(self):
         await self.initialize()

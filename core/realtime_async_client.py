@@ -90,7 +90,6 @@ class HighPrecisionAsyncModbusClient:
             self._kernel32.QueryPerformanceFrequency(ctypes.byref(self._qpc_freq))
             self._clock = self._qpc_counter
 
-
     def _qpc_counter(self):
         """Windows高精度计时器"""
         counter = ctypes.c_int64()
@@ -446,11 +445,43 @@ class HighPrecisionAsyncModbusClient:
                 avg = sum(latencies) / len(latencies)
                 self.stats["报文延迟统计"][f"{op_type}_平均"] = avg
 
+    # # 下面是原始的周期监控，只统计最近100个周期的抖动，记录的是平均周期
+    # # 25.8.19
+    # def _update_poll_cycle_stats(self, master_id):
+    #     """更新单个客户端的轮询周期统计信息"""
+    #     stats = self.client_stats[master_id]
+    #     cycles = stats["轮询周期记录"]
+    #
+    #     # 仅使用最近100次记录
+    #     recent_cycles = cycles[-100:] if len(cycles) > 100 else cycles
+    #
+    #     if not cycles:
+    #         return
+    #
+    #     cycle_stats = stats["轮询周期统计"]
+    #     cycle_stats["平均轮询周期"] = sum(cycles) / len(cycles)
+    #     cycle_stats["最大轮询周期"] = max(cycles)
+    #     cycle_stats["最小轮询周期"] = min(cycles)
+    #
+    #     # 计算抖动（标准差）
+    #     if len(recent_cycles) > 1:
+    #         mean = cycle_stats["平均轮询周期"]
+    #         variance = sum((x - mean) ** 2 for x in recent_cycles) / (len(recent_cycles) - 1)
+    #         cycle_stats["轮询周期抖动"] = variance ** 0.5
+    #     else:
+    #         cycle_stats["轮询周期抖动"] = 0.0
+
+    # 统计最近100个周期的平均周期和抖动
+    # 25.8.19
     def _update_poll_cycle_stats(self, master_id):
         """更新单个客户端的轮询周期统计信息"""
         stats = self.client_stats[master_id]
         cycles = stats["轮询周期记录"]
-        if not cycles:
+
+        # 仅使用最近100次记录
+        recent_cycles = cycles[-100:] if len(cycles) > 100 else cycles
+
+        if not recent_cycles:
             return
 
         cycle_stats = stats["轮询周期统计"]
@@ -458,17 +489,19 @@ class HighPrecisionAsyncModbusClient:
         cycle_stats["最大轮询周期"] = max(cycles)
         cycle_stats["最小轮询周期"] = min(cycles)
 
+        avg_100_cycles = sum(recent_cycles) / len(recent_cycles)
+
         # 计算抖动（标准差）
-        if len(cycles) > 1:
-            mean = cycle_stats["平均轮询周期"]
-            variance = sum((x - mean) ** 2 for x in cycles) / (len(cycles) - 1)
+        if len(recent_cycles) > 1:
+            mean = avg_100_cycles
+            variance = sum((x - mean) ** 2 for x in recent_cycles) / (len(recent_cycles) - 1)
             cycle_stats["轮询周期抖动"] = variance ** 0.5
         else:
             cycle_stats["轮询周期抖动"] = 0.0
 
     def _get_client_poll_cycle_stats_str(self, master_id):
         """获取单个客户端的轮询周期统计字符串"""
-        self._update_poll_cycle_stats(master_id)
+        # self._update_poll_cycle_stats(master_id)
         stats = self.client_stats[master_id]["轮询周期统计"]
 
         formatted_avg = f"{stats['平均轮询周期']:.3f}".rjust(6)
@@ -484,6 +517,7 @@ class HighPrecisionAsyncModbusClient:
 
         # 打印所有客户端统计
         for master_id in self.master_ids:
+            self._update_poll_cycle_stats(master_id)  # 使用最新数据
             print(self._get_client_poll_cycle_stats_str(master_id))
 
         # 添加空行使输出更清晰
@@ -503,90 +537,53 @@ class HighPrecisionAsyncModbusClient:
     #
     #     logger.success(f"预热完成，耗时 {(self._clock() - warmup_start) * 1000:.2f}ms")
 
-    async def _reconnect(self, old_conn):
-        """增强版重连逻辑"""
-        try:
-            # 安全关闭旧连接
-            if old_conn is not None:
-                try:
-                    if hasattr(old_conn, 'close'):
-                        await asyncio.wait_for(old_conn.close(), timeout=1.0)
-                except Exception as e:
-                    logger.warning(f"关闭旧连接异常: {e}")
-
-            # 创建新连接
-            new_conn = await self.pool.get_connection()
-
-            # 验证连接有效性
-            if not hasattr(new_conn, 'host') or not new_conn.connected:
-                raise ConnectionError("新连接无效")
-
-            return new_conn
-
-        except Exception as e:
-            logger.critical(f"重连失败: {e}")
-            await asyncio.sleep(1)  # 避免快速重试
-            raise ConnectionError(f"重连失败: {e}") from e
-
-    async def _safe_close_connections(self, connections):
-        """安全关闭连接集合"""
-        if not connections:
-            return
-
-        await asyncio.gather(
-            *[self._safe_close(c) for c in connections],
-            return_exceptions=True
-        )
-
-    async def _safe_close(self, client):
-        """安全关闭单个连接"""
-        if client is None:
-            return
-
-        try:
-            if hasattr(client, 'close'):
-                await asyncio.wait_for(client.close(), timeout=1.0)
-        except Exception as e:
-            logger.warning(f"关闭连接异常: {e}")
 
     async def _client_loop(self, conn, master_id, cycle_time, end_time):
         """改进的精确周期控制循环（抗累积漂移）"""
         iteration_count = 0
         base_time = self._clock()  # 基准时间
+        last_reset_time = base_time
+
+        # 使用整数运算避免浮点误差
+        cycle_ticks = int(cycle_time * 1e9)  # 纳秒精度
+
+        # 预热开始时间
+        start_time = self._clock()
+
+        # 初始化等待机制
+        await asyncio.sleep(0)  # 让出控制权，确保事件循环启动
 
         while self._clock() < end_time:
             iteration_count += 1
 
-            # 计算绝对目标时间（消除累积误差）
-            target_time = base_time + (iteration_count * cycle_time)
-            now = self._clock()
+            # 每0.5秒重置基准（防止浮点累积）
+            if self._clock() - last_reset_time > 0.5:
+                base_time = self._clock()
+                iteration_count = 0
+                last_reset_time = self._clock()
+                # logger.debug(f"客户端 [{master_id}] 周期基准已重置")
+
+            # 基于纳秒计算目标时间
+            target_time_ns = base_time * 1e9 + iteration_count * cycle_ticks
+            target_time = target_time_ns / 1e9
 
             # 精确等待
-            if now < target_time:
-                remaining = target_time - now
-
-                # 分级等待
-                if remaining > 0.002:
-                    await asyncio.sleep(remaining * 0.7)
-                    # 忙等待剩余时间
-                    bus_start = self._clock()
-                    while self._clock() < target_time:
-                        pass
-                else:
-                    # 纯忙等待
-                    while self._clock() < target_time:
-                        pass
+            now_ns = self._clock() * 1e9
+            if now_ns < target_time_ns:
+                # 使用混合等待策略
+                self._high_precision_wait(target_time)
 
             # 执行操作
-            await self._random_operation(conn, master_id)
+            try:
+                await self._random_operation(conn, master_id)
+            except Exception as e:
+                logger.error(f"操作失败: {e}")
 
-            # 每10次迭代打印统计
-            if iteration_count % 10 == 0:
+            # 定期打印统计（不再使用短期统计）
+            if iteration_count % 100 == 0:
                 async with self.stats_lock:
                     self.print_all_client_poll_cycle_stats()
 
-        # 重置基准时间避免浮点精度累积
-        base_time = self._clock()
 
     async def run_test(self, duration):
         """多连接并行压力测试"""
@@ -677,6 +674,41 @@ class HighPrecisionAsyncModbusClient:
     #     )
     #     with open("connection_anomalies.log", "a", encoding="utf-8") as f:
     #         f.write(log_entry)
+
+    async def _safe_close_connections(self, connections):
+        """安全关闭连接集合"""
+        if not connections:
+            return
+
+        await asyncio.gather(
+            *[self._safe_close(c) for c in connections],
+            return_exceptions=True
+        )
+
+    async def _safe_close(self, client):
+        """安全关闭单个连接 - 修复None问题和异步方法检查"""
+        if client is None:
+            return
+
+        try:
+            # 检查是否有关闭方法
+            if not hasattr(client, 'close'):
+                logger.warning(f"连接对象无close方法: {type(client)}")
+                return
+
+            # 检查关闭方法是否是协程
+            close_method = client.close
+            if asyncio.iscoroutinefunction(close_method):
+                await asyncio.wait_for(close_method(), timeout=1.0)
+            else:
+                # 如果是同步方法，在事件循环中执行
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, close_method)
+
+        except asyncio.TimeoutError:
+            logger.warning(f"关闭连接超时: {self._get_conn_info(client)}")
+        except Exception as e:
+            logger.warning(f"关闭连接异常: {e} | {self._get_conn_info(client)}")
 
     def _generate_report(self):
         """生成包含所有客户端统计的详细报告（更新为轮询周期统计）"""
@@ -800,11 +832,17 @@ class HighPrecisionAsyncModbusClient:
                 logger.error(f"恢复时钟精度失败: {type(e).__name__} - {e}")
                 cleanup_errors += 1
 
-        # 3. 关闭连接池
-        if hasattr(self, 'pool') and self.pool:
+        # 3. 安全关闭连接池
+        if hasattr(self, 'pool') and self.pool is not None:
             try:
-                # 添加超时保护
-                await asyncio.wait_for(self.pool.close_all(), timeout=5.0)
+                # 添加超时保护 - 修复await问题
+                close_task = self.pool.close_all()
+                if asyncio.iscoroutine(close_task):
+                    await asyncio.wait_for(close_task, timeout=5.0)
+                else:
+                    logger.debug("连接池关闭返回非协程对象，直接调用")
+                    close_task()
+
                 logger.debug("连接池已关闭")
             except asyncio.TimeoutError:
                 logger.error("关闭连接池超时")
@@ -812,6 +850,8 @@ class HighPrecisionAsyncModbusClient:
             except Exception as e:
                 logger.error(f"关闭连接池失败: {type(e).__name__} - {e}")
                 cleanup_errors += 1
+        else:
+            logger.debug("连接池不存在或已关闭，跳过关闭操作")
 
         if cleanup_errors > 0:
             logger.warning(f"清理完成，但有{cleanup_errors}个错误")
