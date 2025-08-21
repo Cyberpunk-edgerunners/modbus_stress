@@ -142,48 +142,56 @@ class AsyncModbusConnection:
             raise
 
     async def get_connection(self, conn_id=None):
-        """获取连接(支持指定连接ID或轮询获取)"""
-        # 确保连接池已初始化
+        """获取连接 - 修复分配逻辑确保均匀分配"""
         if not self._initialized:
             await self.initialize()
 
-        async with self._lock:
-            # 优先处理指定连接ID
-            if conn_id is not None:
-                if 0 <= conn_id < len(self._connections):
-                    conn = self._connections[conn_id]
-                    # 修复无效连接
-                    if conn is None or not getattr(conn, 'connected', False):
-                        try:
-                            self._connections[conn_id] = await self._safe_create_connection(conn_id)
-                            conn = self._connections[conn_id]
-                        except Exception as e:
-                            logger.error(f"连接{conn_id}修复失败: {str(e)}")
-                            raise ConnectionError(f"连接{conn_id}不可用") from e
-                    return conn
-                raise IndexError(f"无效连接ID: {conn_id}")
+        # 确保连接ID在有效范围内
+        if conn_id is not None and (conn_id < 0 or conn_id >= len(self._connections)):
+            raise ValueError(f"无效连接ID: {conn_id}")
 
-            # 自动分配模式：优先返回有效连接
-            for i, conn in enumerate(self._connections):
+        # 使用连接ID分配策略
+        if conn_id is not None:
+            return await self._get_specific_connection(conn_id)
+
+        # 新增：轮询分配策略
+        async with self._lock:
+            # 查找下一个可用连接
+            for _ in range(len(self._connections)):
+                self._last_used_index = (self._last_used_index + 1) % len(self._connections)
+                conn = self._connections[self._last_used_index]
+
                 if conn and getattr(conn, 'connected', False):
                     return conn
 
-            # 尝试修复失效连接（第一次修复尝试）
-            for i, conn in enumerate(self._connections):
-                if conn is None or not getattr(conn, 'connected', False):
-                    try:
-                        self._connections[i] = await self._safe_create_connection(i)
-                        if self._connections[i] and self._connections[i].connected:
-                            return self._connections[i]
-                    except:
-                        pass  # 首次修复失败暂不处理
-
-            # 终极验证：连接池真满还是假满
-            active_conns = [c for c in self._connections if c and getattr(c, 'connected', False)]
-            if active_conns:
-                return active_conns[0]  # 返回首个可用连接
+            # 如果没有可用连接，尝试修复
+            for i in range(len(self._connections)):
+                try:
+                    self._connections[i] = await self._safe_create_connection(i)
+                    if self._connections[i] and self._connections[i].connected:
+                        self._last_used_index = i
+                        return self._connections[i]
+                except:
+                    pass
 
             raise ConnectionError("连接池无可用连接")
+
+    async def _get_specific_connection(self, conn_id):
+        """获取指定ID的连接"""
+        async with self._lock:
+            if 0 <= conn_id < len(self._connections):
+                conn = self._connections[conn_id]
+                if conn and getattr(conn, 'connected', False):
+                    return conn
+
+                # 修复连接
+                try:
+                    self._connections[conn_id] = await self._safe_create_connection(conn_id)
+                    return self._connections[conn_id]
+                except Exception as e:
+                    logger.error(f"修复连接{conn_id}失败: {e}")
+
+            raise ConnectionError(f"无法获取连接ID: {conn_id}")
 
     async def _monitor_connections(self):
         """鲁棒的连接监控"""
