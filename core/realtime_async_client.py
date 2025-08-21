@@ -35,8 +35,14 @@ class HighPrecisionAsyncModbusClient:
         self.client_stats = {}
         self.stats_lock = asyncio.Lock()
 
-        self.last_request_sent = {}       # 请求发送时间记录
-        self.last_response_received = {}  # 响应接收时间记录
+        # 重构时间点记录系统 - 每个客户端独立上下文
+        self.client_context = {
+            master_id: {
+                "last_request_sent": None,
+                "last_response_received": None,
+                "operation_lock": asyncio.Lock()  # 每个客户端独立的锁
+            } for master_id in master_ids
+        }
 
         # 为每个客户端分配连接ID
         self.client_conn_ids = {
@@ -46,8 +52,6 @@ class HighPrecisionAsyncModbusClient:
         # 为每个客户端初始化统计
         for master_id in master_ids:
             self._init_client_stats(master_id)
-            self.last_request_sent[master_id] = None
-            self.last_response_received[master_id] = None
 
         # 初始化全局统计
         self.global_stats = {
@@ -402,53 +406,61 @@ class HighPrecisionAsyncModbusClient:
 
     async def _random_operation(self, client, master_id):
         """执行随机Modbus操作（精确轮询周期统计）"""
+        # 获取客户端上下文
+        ctx = self.client_context[master_id]
+
         # 记录本次请求发送时间（关键时间点）
         request_sent_time = self._clock()
 
         # 更新请求发送时间（用于下次计算周期）
-        async with self.stats_lock:
-            last_resp_time = self.last_response_received[master_id]
-            self.last_request_sent[master_id] = request_sent_time
+        async with ctx["operation_lock"]:
+            last_resp_time = ctx["last_response_received"]
+            ctx["last_request_sent"] = request_sent_time
 
             # 只有当有上一次响应时间时才计算周期
             if last_resp_time is not None:
                 # 计算真实轮询周期：本次请求发送时间 - 上次响应接收时间
                 true_poll_interval = (request_sent_time - last_resp_time) * 1000
 
-                # # 确保周期为正
-                # if true_poll_interval < 0:
-                #     logger.error(f"负轮询周期: {true_poll_interval:.3f}ms, "
-                #                  f"请求时间={request_sent_time}, "
-                #                  f"响应时间={last_resp_time}")
-                #     true_poll_interval = abs(true_poll_interval)
+                # 确保周期为正且合理
+                if true_poll_interval < 0:
+                    logger.error(f"负轮询周期: {true_poll_interval:.3f}ms, "
+                                 f"请求时间={request_sent_time}, "
+                                 f"响应时间={last_resp_time}")
+                    # 使用绝对值继续计算
+                    true_poll_interval = abs(true_poll_interval)
 
-                # 更新累积统计
-                cum_stats = self.client_stats[master_id]["轮询周期累积"]
-                cum_stats["总和"] += true_poll_interval
-                cum_stats["计数"] += 1
+                # 合理的周期范围检查 (0.1ms - 100ms)
+                if true_poll_interval > 100 or true_poll_interval < 0.1:
+                    logger.warning(f"异常轮询周期值: {true_poll_interval:.3f}ms")
+                else:
+                    # 更新累积统计
+                    cum_stats = self.client_stats[master_id]["轮询周期累积"]
+                    cum_stats["总和"] += true_poll_interval
+                    cum_stats["计数"] += 1
 
-                # 更新最大值和最小值
-                if true_poll_interval > cum_stats["最大值"]:
-                    cum_stats["最大值"] = true_poll_interval
-                if true_poll_interval < cum_stats["最小值"]:
-                    cum_stats["最小值"] = true_poll_interval
+                    # 更新最大值和最小值
+                    if true_poll_interval > cum_stats["最大值"]:
+                        cum_stats["最大值"] = true_poll_interval
+                    if true_poll_interval < cum_stats["最小值"]:
+                        cum_stats["最小值"] = true_poll_interval
 
-                # 添加到记录
-                self.client_stats[master_id]["轮询周期记录"].append(true_poll_interval)
+                    # 添加到记录
+                    self.client_stats[master_id]["轮询周期记录"].append(true_poll_interval)
 
-                # 检查偏差（与设定的周期比较）
-                config = settings.MASTER_CONFIGS.get(master_id, {})
-                target_cycle = config.get("cycle_time") or 1.0 / settings.TARGET_FREQUENCY
-                target_cycle_ms = target_cycle * 1000
-                deviation = abs(true_poll_interval - target_cycle_ms)
+                    # 检查偏差（与设定的周期比较）
+                    config = settings.MASTER_CONFIGS.get(master_id, {})
+                    target_cycle = config.get("cycle_time") or 1.0 / settings.TARGET_FREQUENCY
+                    target_cycle_ms = target_cycle * 1000
+                    deviation = abs(true_poll_interval - target_cycle_ms)
 
-                if deviation > 20:  # 超过20ms偏差记录警告
-                    logger.warning(
-                        f"客户端 [{master_id}] 轮询周期偏差: "
-                        f"设定={target_cycle_ms:.3f}ms, "
-                        f"实际={true_poll_interval:.3f}ms, "
-                        f"偏差={deviation:.3f}ms"
-                    )
+                    if deviation > 20:  # 超过20ms偏差记录警告
+                        logger.warning(
+                            f"客户端 [{master_id}] 轮询周期偏差: "
+                            f"设定={target_cycle_ms:.3f}ms, "
+                            f"实际={true_poll_interval:.3f}ms, "
+                            f"偏差={deviation:.3f}ms"
+                        )
 
         # 随机选择操作类型
         op_type = random.randint(0, 2)
@@ -485,10 +497,6 @@ class HighPrecisionAsyncModbusClient:
                 # 记录响应完成时间
                 response_time = self._clock()
 
-                # 记录响应接收时间
-                async with self.stats_lock:
-                    self.last_response_received[master_id] = response_time
-
             except asyncio.TimeoutError:
                 # 记录超时请求
                 async with self.stats_lock:
@@ -499,8 +507,11 @@ class HighPrecisionAsyncModbusClient:
                 logger.error(f"客户端 [{master_id}] 操作超时")
                 return False
 
-            # 计算报文延迟
+            # 更新响应时间（在客户端锁保护下）
             if response_time is not None:
+                async with ctx["operation_lock"]:
+                    ctx["last_response_received"] = response_time
+
                 latency_ms = (response_time - operation_start) * 1000
 
                 # 更新统计信息
@@ -694,13 +705,15 @@ class HighPrecisionAsyncModbusClient:
 
     async def _client_loop(self, conn, master_id, cycle_time, end_time):
         """基于响应时间的精确周期控制"""
+        # 获取客户端上下文
+        ctx = self.client_context[master_id]
+
         # 获取该客户端的周期配置
         config = settings.MASTER_CONFIGS.get(master_id, {})
         cycle_time = config.get("cycle_time") or 1.0 / settings.TARGET_FREQUENCY
 
         # 初始化迭代计数
         iteration_count = 0
-        next_start_time = self._clock()  # 下次操作开始时间
 
         # 让出控制权，确保事件循环启动
         await asyncio.sleep(0)
@@ -708,16 +721,29 @@ class HighPrecisionAsyncModbusClient:
         while self._clock() < end_time:
             iteration_count += 1
 
-            # 精确等待到目标时间
+            # 获取上次响应时间（在锁保护下）
+            async with ctx["operation_lock"]:
+                last_response = ctx["last_response_received"]
+
+            # 计算下次请求发送时间
+            if last_response is not None:
+                # 基于上次响应时间 + 周期
+                next_send_time = last_response + cycle_time
+            else:
+                # 第一次请求，立即执行
+                next_send_time = self._clock()
+
+            # 精确等待到目标发送时间
             current_time = self._clock()
-            wait_time = next_start_time - current_time
+            wait_duration = max(0, next_send_time - current_time)
 
-            if wait_time > 0:
-                # 优化等待策略（无异步等待）
-                self._precise_wait(next_start_time)
-
-            # 记录操作开始时间
-            cycle_start = self._clock()
+            if wait_duration > 0:
+                # 使用混合等待策略
+                if wait_duration > 0.002:  # >2ms
+                    time.sleep(wait_duration * 0.8)
+                    self._spin_wait(wait_duration * 0.2)
+                else:  # ≤2ms
+                    self._spin_wait(wait_duration)
 
             # 执行操作
             try:
@@ -725,17 +751,8 @@ class HighPrecisionAsyncModbusClient:
             except Exception as e:
                 logger.error(f"操作失败: {e}")
 
-            # 计算实际执行时间
-            operation_duration = self._clock() - cycle_start
-
-            # 计算下次开始时间（基于当前完成时间+周期-执行时间）
-            next_start_time = max(
-                self._clock() + cycle_time - operation_duration,
-                self._clock()  # 确保不会倒退
-            )
-
-            # 定期打印统计（降低频率）
-            if iteration_count % 500 == 0:
+            # 定期打印统计
+            if iteration_count % 100 == 0:
                 async with self.stats_lock:
                     self.print_all_client_poll_cycle_stats()
 

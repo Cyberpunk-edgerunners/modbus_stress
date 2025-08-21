@@ -193,6 +193,32 @@ class AsyncModbusConnection:
 
             raise ConnectionError(f"无法获取连接ID: {conn_id}")
 
+    async def execute(self, client, request):
+        """执行请求并记录精确网络时间戳"""
+        # 记录发送前时间
+        send_time = time.perf_counter()
+
+        # 发送请求
+        await client.protocol.send(request)
+
+        # 等待响应
+        response = await self._wait_response(client, request.transaction_id)
+
+        # 记录接收到响应后的时间
+        recv_time = time.perf_counter()
+
+        return response, send_time, recv_time
+
+    async def _wait_response(self, client, transaction_id):
+        """等待特定交易ID的响应"""
+        # 简化的等待逻辑，实际实现应根据协议定制
+        while True:
+            # 这里应该实现响应等待的实际逻辑
+            # 示例：检查响应队列中是否有对应交易ID的响应
+            if hasattr(client, 'responses') and transaction_id in client.responses:
+                return client.responses.pop(transaction_id)
+            await asyncio.sleep(0.001)
+
     async def _monitor_connections(self):
         """鲁棒的连接监控"""
         logger.info("连接监控任务启动")
