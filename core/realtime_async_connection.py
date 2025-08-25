@@ -19,6 +19,7 @@ class AsyncModbusConnection:
         self._lock = asyncio.Lock()
         self._initialized = False
         self._monitor_task = None
+        self._last_used_index = -1
         self._init_realtime()
 
     def _init_realtime(self):
@@ -193,21 +194,30 @@ class AsyncModbusConnection:
 
             raise ConnectionError(f"无法获取连接ID: {conn_id}")
 
-    async def execute(self, client, request):
-        """执行请求并记录精确网络时间戳"""
+    async def execute(self, client, op_type, addr, count, values=None):
+        """执行请求并记录网络时间戳"""
         # 记录发送前时间
         send_time = time.perf_counter()
 
-        # 发送请求
-        await client.protocol.send(request)
+        try:
+            # 执行请求
+            if op_type == 0:  # Read Input Registers
+                result = await client.read_input_registers(address=addr, count=count)
+            elif op_type == 1:  # Read Holding Registers
+                result = await client.read_holding_registers(address=addr, count=count)
+            elif op_type == 2:  # Write Multiple Registers
+                result = await client.write_registers(address=addr, values=values)
+            else:
+                raise ValueError(f"无效的操作类型: {op_type}")
 
-        # 等待响应
-        response = await self._wait_response(client, request.transaction_id)
+            # 记录接收到响应后的时间
+            recv_time = time.perf_counter()
 
-        # 记录接收到响应后的时间
-        recv_time = time.perf_counter()
-
-        return response, send_time, recv_time
+            return result, send_time, recv_time
+        except Exception as e:
+            # 记录接收时间
+            recv_time = time.perf_counter()
+            raise e
 
     async def _wait_response(self, client, transaction_id):
         """等待特定交易ID的响应"""

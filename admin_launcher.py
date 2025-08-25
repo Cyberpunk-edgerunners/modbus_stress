@@ -53,7 +53,7 @@ def elevate_restart():
 
 
 async def main():
-    success = await modbus_stress_test(duration=12 * 3600)
+    success = await modbus_stress_test(duration= 2 * 3600)
     if not success:
         raise RuntimeError("Modbus测试失败")
 

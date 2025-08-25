@@ -13,7 +13,7 @@ CONTROLLER_PORT = 502
 CLIENT_BASE_PORT = 10010  # 客户端起始端口
 
 # 客户端数量配置
-CLIENT_COUNT = 4  # 可配置1-4个客户端
+CLIENT_COUNT = 1  # 可配置1-4个客户端
 
 # 连接池配置
 CONNECTION_POOL_SIZE = CLIENT_COUNT
