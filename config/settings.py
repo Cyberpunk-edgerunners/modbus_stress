@@ -10,7 +10,7 @@ load_dotenv()
 
 CONTROLLER_IP = "192.168.2.100"  # 直接写死IP，不使用环境变量
 CONTROLLER_PORT = 502
-CLIENT_BASE_PORT = 10010  # 客户端起始端口
+CLIENT_BASE_PORT = 10020  # 客户端起始端口
 
 # 客户端数量配置
 CLIENT_COUNT = 1  # 可配置1-4个客户端
@@ -54,17 +54,17 @@ MASTER_CONFIGS = {
         "description": "随机断开延迟重连",
         "disconnect_prob": 0,
         "reconnect_delay": (60, 300),
-        "cycle_time": 0.001
+        "cycle_time": 0.002
     },
     "master_3": {
         "description": "50ms周期长帧",
         "disconnect_prob": 0,
-        "cycle_time": 0.001
+        "cycle_time": 0.002
     },
     "master_4": {
         "description": "1ms周期忙等待",
         "disconnect_prob": 0,
-        "cycle_time": 0.001
+        "cycle_time": 0.002
     }
 }
 

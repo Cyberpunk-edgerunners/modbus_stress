@@ -32,6 +32,7 @@ class HighPrecisionAsyncModbusClient:
         self.pool = AsyncModbusConnection()
         self._init_clock()
         self._init_realtime()
+        self._init_cpu_wait()
         self.client_stats = {}
         self.stats_lock = asyncio.Lock()
 
@@ -108,35 +109,41 @@ class HighPrecisionAsyncModbusClient:
             }
         }
 
+    # 修改时钟获取函数，直接使用最高精度接口
     def _init_clock(self):
-        """高精度时钟源（带缓存优化）"""
-        if hasattr(time, 'perf_counter'):
-            self._clock = self._cached_perf_counter
-            self._last_time = 0.0
-        else:
+        """高精度时钟源（直接使用原生API不缓存）"""
+        if sys.platform == "win32":
             self._kernel32 = ctypes.windll.kernel32
             self._qpc_freq = ctypes.c_int64()
             self._kernel32.QueryPerformanceFrequency(ctypes.byref(self._qpc_freq))
-            self._clock = self._cached_qpc_counter
-            self._last_time = 0.0
+            self._clock = self._qpc_counter  # 直接使用QPC
+        else:
+            self._clock = time.perf_counter  # Linux使用perf_counter
 
-    def _cached_perf_counter(self):
-        """带缓存的perf_counter实现"""
-        current = time.perf_counter()
-        # 每毫秒更新一次缓存
-        if int(current * 1000) != int(self._last_time * 1000):
-            self._last_time = current
-        return self._last_time
-
-    def _cached_qpc_counter(self):
-        """带缓存的QPC实现"""
+    def _qpc_counter(self):
+        """Windows QPC时钟实现"""
         counter = ctypes.c_int64()
         self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
-        current = counter.value / self._qpc_freq.value
-        # 每毫秒更新一次缓存
-        if int(current * 1000) != int(self._last_time * 1000):
-            self._last_time = current
-        return self._last_time
+        return counter.value / self._qpc_freq.value
+
+    # def _cached_perf_counter(self):
+    #     """带缓存的perf_counter实现"""
+    #     current = time.perf_counter()
+    #     # 每毫秒更新一次缓存
+    #     if int(current * 1000) != int(self._last_time * 1000):
+    #         self._last_time = current
+    #     return self._last_time
+
+    #优化缓存时钟改为实时获取
+    # def _cached_qpc_counter(self):
+    #     """带缓存的QPC实现"""
+    #     counter = ctypes.c_int64()
+    #     self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
+    #     current = counter.value / self._qpc_freq.value
+    #     # 每毫秒更新一次缓存
+    #     if int(current * 1000) != int(self._last_time * 1000):
+    #         self._last_time = current
+    #     return self._last_time
 
 
     def _init_realtime(self):
@@ -170,6 +177,25 @@ class HighPrecisionAsyncModbusClient:
             except Exception as e:
                 logger.error(f"CPU绑定失败: {e}")
 
+    def _init_cpu_wait(self):
+        """初始化CPU等待函数"""
+        self._cpu_wait_fn = None
+
+        # 尝试加载YieldProcessor
+        if sys.platform == "win32":
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            try:
+                # 检查YieldProcessor是否可用
+                kernel32.YieldProcessor
+                self._cpu_wait_fn = lambda: kernel32.YieldProcessor()
+                logger.debug("使用YieldProcessor进行等待优化")
+            except AttributeError:
+                logger.warning("YieldProcessor不可用，使用空指令替代")
+
+        # 如果YieldProcessor不可用，使用空函数替代
+        if self._cpu_wait_fn is None:
+            # 使用空操作指令作为替代
+            self._cpu_wait_fn = lambda: None
 
     def _set_process_priority(self, priority_class):
         """进程优先级设置"""
@@ -256,7 +282,7 @@ class HighPrecisionAsyncModbusClient:
             if 'hProcess' in locals():
                 win32api.CloseHandle(hProcess)
 
-
+    # 暂时不用
     def _control_cycle_timing(self, cycle_start):
         """混合精度周期控制（纯Python实现）"""
         target_cycle = 1.0 / settings.TARGET_FREQUENCY
@@ -274,6 +300,7 @@ class HighPrecisionAsyncModbusClient:
             else:  # <2ms纯忙等待
                 self._busy_wait(remaining)
 
+    # 暂时不用
     def _busy_wait(self, duration):
         """优化的忙等待"""
         end_time = self._clock() + duration
@@ -281,6 +308,7 @@ class HighPrecisionAsyncModbusClient:
             if end_time - self._clock() > 0.001:  # >1ms剩余时短暂释放
                 time.sleep(0.0001)  # 100μs级释放
 
+    # 暂时不用
     def _high_precision_wait(self, cycle_start):
         """混合精度周期控制"""
         target_cycle = 1.0 / settings.TARGET_FREQUENCY
@@ -322,34 +350,25 @@ class HighPrecisionAsyncModbusClient:
             self._spin_wait(spin_duration)
 
     def _spin_wait(self, duration):
-        """优化的忙等待（增加让出控制权点）"""
+        """优化的忙等待（兼容所有平台）"""
         if duration <= 0:
             return
 
         end_time = self._clock() + duration
         check_counter = 0
 
-        # 短时忙等待（<0.5ms）
-        if duration < 0.0005:
-            while self._clock() < end_time:
-                pass
-        # 中等时长忙等待
-        elif duration < 0.001:  # 0.5ms-1ms
-            while self._clock() < end_time:
-                # 每500次检查让出一次（约1us）
-                check_counter += 1
-                if check_counter % 500 == 0:
-                    time.sleep(0)  # 短暂让出控制权
-        # 长时忙等待（带短暂释放）
-        else:
-            while self._clock() < end_time:
-                # 每100次检查让出一次
-                check_counter += 1
-                if check_counter % 100 == 0:
-                    # 每100us让出一次
-                    if end_time - self._clock() > 0.0001:
-                        time.sleep(0.00001)
+        while self._clock() < end_time:
+            # 周期性地使用CPU等待函数
+            if check_counter % 100 == 0:
+                self._cpu_wait_fn()
 
+            check_counter += 1
+
+            # 长时间等待时偶尔让出控制权
+            if duration > 0.001 and check_counter % 1000 == 0:
+                time.sleep(0)  # 让出控制权但立即返回
+
+    # 暂时不用
     def _precise_wait(self, target_time):
         """高精度等待（无异步操作）"""
         current = self._clock()
@@ -369,6 +388,7 @@ class HighPrecisionAsyncModbusClient:
             # 短时直接忙等待
             self._micro_spin_wait(duration)
 
+    # 暂时不用
     def _micro_spin_wait(self, duration):
         """微秒级精度的忙等待"""
         if duration <= 0:
@@ -378,40 +398,36 @@ class HighPrecisionAsyncModbusClient:
         while self._clock() < end_time:
             pass
 
-    def _record_cycle_anomaly(self, cycle_time):
-        """实时记录异常周期到独立文件"""
-        try:
-            cycle_ms = cycle_time * 1000
-            if cycle_ms > 20:  # 超过20ms记录
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    def _precision_wait_until(self, target_time):
+        """精确等待直到目标时间（使用优化的忙等待）"""
+        current_time = self._clock()
 
-                # 获取简化调用栈
-                stack = []
-                for frame in traceback.extract_stack()[:-4]:  # 跳过最后4个内部帧
-                    if "site-packages" not in frame.filename:  # 过滤第三方库
-                        stack.append(f"{frame.filename}:{frame.lineno} ({frame.name})")
+        # 初始快速旋转（适用于极短等待）
+        while current_time < target_time and (target_time - current_time) < 0.0001:  # < 100μs
+            self._cpu_wait_fn()
+            current_time = self._clock()
 
-                # 准备日志条目
-                stats = self.stats["周期统计"]
-                log_entry = (
-                        f"[{timestamp}] {cycle_ms:.3f}ms | "
-                        f"avg={stats['平均周期']:.3f}ms | "
-                        f"max={stats['最大周期']:.3f}ms | "
-                        f"jitter={stats['周期抖动']:.3f}ms\n"
-                        f"调用栈:\n  " + "\n  ".join(stack[-3:]) + "\n"
-                        f"{'-' * 40}\n"
-                )
+        # 分级等待策略（确保最大兼容性）
+        while current_time < target_time:
+            remaining = target_time - current_time
 
-                # 实时写入文件并打印
-                with open(self.anomaly_log_path, "a", encoding="utf-8") as f:
-                    f.write(log_entry)
+            # 大于1ms时使用混合等待
+            if remaining > 0.001:  # >1ms
+                sleep_time = remaining * 0.7
+                spin_time = remaining - sleep_time
+                time.sleep(sleep_time)
+                self._spin_wait(spin_time)
+                return
 
-                # 立即输出到控制台
-                print(f"\n! 周期异常 {cycle_ms:.1f}ms !", end="", flush=True)
-                return True
-        except Exception as e:
-            print(f"\n记录异常失败: {str(e)}", file=sys.stderr)
-        return False
+            # 100μs-1ms使用纯忙等待
+            elif remaining > 0.0001:  # 100μs-1ms
+                self._spin_wait(remaining)
+                return
+
+            # 小于100μs使用空指令
+            else:
+                self._cpu_wait_fn()
+                current_time = self._clock()
 
     async def _random_operation(self, client, master_id):
         """执行随机Modbus操作（精确轮询周期统计）"""
@@ -698,45 +714,26 @@ class HighPrecisionAsyncModbusClient:
     #     logger.success(f"预热完成，耗时 {(self._clock() - warmup_start) * 1000:.2f}ms")
 
     async def _client_loop(self, conn, master_id, cycle_time, end_time):
-        """基于响应时间的精确周期控制"""
-        # 获取客户端上下文
+        """基于响应时间的精确周期控制（修复兼容性问题）"""
         ctx = self.client_context[master_id]
-
-        # 获取该客户端的周期配置
-        config = settings.MASTER_CONFIGS.get(master_id, {})
-        cycle_time = config.get("cycle_time") or 1.0 / settings.TARGET_FREQUENCY
-
-        # 初始化迭代计数
         iteration_count = 0
 
-        # 让出控制权，确保事件循环启动
+        # 初始让出控制权
         await asyncio.sleep(0)
+
+        # 初始化第一个周期的发送时间
+        next_send_time = self._clock()
 
         while self._clock() < end_time:
             iteration_count += 1
 
-            # 获取上次网络请求发送时间
-            async with ctx["operation_lock"]:
-                last_send_time = ctx["last_network_request_sent"]
-
-            # 计算下次请求发送时间
-            if last_send_time is not None:
-                next_send_time = last_send_time + cycle_time
-            else:
-                # 第一次请求，立即执行
-                next_send_time = self._clock()
-
-            # 精确等待到目标发送时间
+            # 精确等待到发送时间
             current_time = self._clock()
-            wait_duration = max(0, next_send_time - current_time)
+            if current_time < next_send_time:
+                self._precision_wait_until(next_send_time)
 
-            if wait_duration > 0:
-                # 使用混合等待策略
-                if wait_duration > 0.002:  # >2ms
-                    time.sleep(wait_duration * 0.8)
-                    self._spin_wait(wait_duration * 0.2)
-                else:  # ≤2ms
-                    self._spin_wait(wait_duration)
+            # 记录操作开始时间
+            operation_start = self._clock()
 
             # 执行操作
             try:
@@ -744,11 +741,38 @@ class HighPrecisionAsyncModbusClient:
             except Exception as e:
                 logger.error(f"操作失败: {e}")
 
-            # 定期打印统计
-            if iteration_count % 100 == 0:
+            # 更新下一次发送时间
+            async with ctx["operation_lock"]:
+                # 如果操作没有更新时间戳（如失败），使用操作开始时间
+                if ctx["last_network_request_sent"] is None:
+                    send_time = operation_start
+                else:
+                    send_time = ctx["last_network_request_sent"]
+
+                # 计算下次发送时间
+                next_send_time = send_time + cycle_time
+
+            # 定期打印统计（减少频率）
+            if iteration_count % 500 == 0:
                 async with self.stats_lock:
                     self.print_all_client_poll_cycle_stats()
 
+                # 每500次操作检查系统时钟精度
+                if sys.platform == "win32" and iteration_count % 10000 == 0:
+                    self._check_clock_precision()
+
+    def _check_clock_precision(self):
+        """检查并维护系统时钟精度"""
+        if not hasattr(self, '_winmm'):
+            return
+
+        try:
+            # 每隔一段时间重新设置时钟精度
+            self._winmm.timeEndPeriod(1)
+            self._winmm.timeBeginPeriod(1)
+            # logger.debug("系统时钟精度已刷新")
+        except Exception as e:
+            logger.warning(f"刷新时钟精度失败: {e}")
 
     async def run_test(self, duration):
         """多连接并行压力测试"""
