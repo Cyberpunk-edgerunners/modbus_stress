@@ -213,7 +213,7 @@ class AsyncModbusConnection:
             # 记录接收到响应后的时间
             recv_time = time.perf_counter()
 
-            return result, send_time, recv_time
+            return result, send_time, recv_time, client
         except Exception as e:
             # 记录接收时间
             recv_time = time.perf_counter()
