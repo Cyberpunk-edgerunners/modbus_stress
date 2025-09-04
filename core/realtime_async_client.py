@@ -38,11 +38,11 @@ class HighPrecisionAsyncModbusClient:
         self.client_stats = {}
         self.stats_lock = asyncio.Lock()
 
-        # 重构时间点记录系统 - 每个客户端独立上下文
+        # 时间点记录系统 - 每个客户端独立上下文
         self.client_context = {
             master_id: {
-                "last_network_request_sent": None,  # 精确网络请求发送时间
-                "last_network_response_received": None,  # 精确网络响应接收时间
+                "last_network_request_sent": None,  # 网络请求发送时间
+                "last_network_response_received": None,  # 网络响应接收时间
                 "operation_lock": asyncio.Lock()  # 每个客户端独立的锁
             } for master_id in master_ids
         }
@@ -101,30 +101,19 @@ class HighPrecisionAsyncModbusClient:
             "失败请求": 0,
             "超时请求": 0,
             "开始时间": self._clock(),
-            "轮询周期记录": deque(maxlen=1000),
-            "等待时间记录": deque(maxlen=1000),
-            "报文延迟记录": deque(maxlen=1000),
+            "轮询周期记录": deque(maxlen=10000),
+            "报文延迟记录": deque(maxlen=10000),
             "轮询周期统计": {
                 "平均轮询周期": 0.0,
                 "最大轮询周期": 0.0,
                 "最小轮询周期": float('inf'),
                 "轮询周期抖动": 0.0,
-                "最大轮询周期抖动": 0.0
+                "最大轮询周期抖动": 0.0,
+                "p50": 0.0,
+                "p95": 0.0,
+                "p99": 0.0
             },
             "轮询周期累积": {
-                "总和": 0.0,
-                "计数": 0,
-                "最大值": 0.0,
-                "最小值": float('inf')
-            },
-            "等待时间统计": {
-                "平均等待时间": 0.0,
-                "最大等待时间": 0.0,
-                "最小等待时间": float('inf'),
-                "等待时间抖动": 0.0,
-                "最大等待时间抖动": 0.0
-            },
-            "等待时间累积": {
                 "总和": 0.0,
                 "计数": 0,
                 "最大值": 0.0,
@@ -161,26 +150,6 @@ class HighPrecisionAsyncModbusClient:
         counter = ctypes.c_int64()
         self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
         return counter.value / self._qpc_freq.value
-
-    # def _cached_perf_counter(self):
-    #     """带缓存的perf_counter实现"""
-    #     current = time.perf_counter()
-    #     # 每毫秒更新一次缓存
-    #     if int(current * 1000) != int(self._last_time * 1000):
-    #         self._last_time = current
-    #     return self._last_time
-
-    #优化缓存时钟改为实时获取
-    # def _cached_qpc_counter(self):
-    #     """带缓存的QPC实现"""
-    #     counter = ctypes.c_int64()
-    #     self._kernel32.QueryPerformanceCounter(ctypes.byref(counter))
-    #     current = counter.value / self._qpc_freq.value
-    #     # 每毫秒更新一次缓存
-    #     if int(current * 1000) != int(self._last_time * 1000):
-    #         self._last_time = current
-    #     return self._last_time
-
 
     def _init_realtime(self):
         """Windows实时环境初始化"""
@@ -257,7 +226,6 @@ class HighPrecisionAsyncModbusClient:
             logger.error(f"优先级设置失败: {e}")
             raise RuntimeError("进程优先级设置失败") from e
 
-
     def _priority_name(self, class_code):
         """将优先级代码转为可读名称"""
         return {
@@ -265,7 +233,6 @@ class HighPrecisionAsyncModbusClient:
             HIGH_PRIORITY_CLASS: "高",
             win32con.NORMAL_PRIORITY_CLASS: "正常"
         }.get(class_code, f"未知({class_code:#x})")
-
 
     def _set_thread_priority(self, priority_level=THREAD_PRIORITY_TIME_CRITICAL):
         """设置当前线程优先级"""
@@ -380,7 +347,6 @@ class HighPrecisionAsyncModbusClient:
 
     async def _log_packet(self, packet_data):
         try:
-            # 确保每次都有有效的文件名
             real_timestamp = self._get_real_timestamp(packet_data['timestamp'])
             date_str = datetime.fromtimestamp(real_timestamp).strftime("%Y%m%d")
             filename = self.logs_dir / f"modbus_packets_{date_str}.log"
@@ -402,6 +368,53 @@ class HighPrecisionAsyncModbusClient:
             })
         except Exception as e:
             logger.error(f"提交报文失败: {e}")
+
+    async def _log_request(self, master_id, send_time, op_type, addr, count, values,
+                           client_port, server_port):
+        """记录请求报文"""
+        await self._log_packet({
+            "timestamp": send_time,
+            "type": "request",
+            "master_id": master_id,
+            "src_port": client_port,  # 源端口=客户端
+            "dst_port": server_port,  # 目的端口=服务器
+            "operation": op_type,
+            "address": addr,
+            "count": count,
+            "values": values
+        })
+
+    async def _log_response(self, master_id, recv_time, op_type, addr, count,
+                            network_latency_ms, client_port, server_port):
+        """记录响应报文"""
+        await self._log_packet({
+            "timestamp": recv_time,
+            "type": "response",
+            "master_id": master_id,
+            "src_port": server_port,  # 源端口=服务器
+            "dst_port": client_port,  # 目的端口=客户端
+            "operation": op_type,  # 添加操作信息
+            "address": addr,  # 添加地址
+            "count": count,  # 添加数量
+            "latency_ms": network_latency_ms
+        })
+
+    async def _log_error(self, master_id, recv_time, op_type, addr, count,
+                         error_type, error_msg, client_port, server_port):
+        """记录错误报文"""
+        await self._log_packet({
+            "timestamp": recv_time,
+            "type": "error",
+            "master_id": master_id,
+            "src_port": client_port,  # 源端口=客户端
+            "dst_port": server_port,  # 目的端口=服务器
+            "operation": op_type,  # 添加操作信息
+            "address": addr,  # 添加地址
+            "count": count,  # 添加数量
+            "error_type": error_type,
+            "error_msg": error_msg
+        })
+
     # 暂时不用
     def _control_cycle_timing(self, cycle_start):
         """混合精度周期控制（纯Python实现）"""
@@ -549,95 +562,35 @@ class HighPrecisionAsyncModbusClient:
                 self._cpu_wait_fn()
                 current_time = self._clock()
 
-    async def _log_request(self, master_id, send_time, op_type, addr, count, values,
-                           client_port, server_port):
-        """记录请求报文"""
-        await self._log_packet({
-            "timestamp": send_time,
-            "type": "request",
-            "master_id": master_id,
-            "src_port": client_port,  # 源端口=客户端
-            "dst_port": server_port,  # 目的端口=服务器
-            "operation": op_type,
-            "address": addr,
-            "count": count,
-            "values": values
-        })
-
-    async def _log_response(self, master_id, recv_time, op_type, addr, count,
-                            network_latency_ms, client_port, server_port):
-        """记录响应报文"""
-        await self._log_packet({
-            "timestamp": recv_time,
-            "type": "response",
-            "master_id": master_id,
-            "src_port": server_port,  # 源端口=服务器
-            "dst_port": client_port,  # 目的端口=客户端
-            "operation": op_type,  # 添加操作信息
-            "address": addr,  # 添加地址
-            "count": count,  # 添加数量
-            "latency_ms": network_latency_ms
-        })
-
-    async def _log_error(self, master_id, recv_time, op_type, addr, count,
-                         error_type, error_msg, client_port, server_port):
-        """记录错误报文"""
-        await self._log_packet({
-            "timestamp": recv_time,
-            "type": "error",
-            "master_id": master_id,
-            "src_port": client_port,  # 源端口=客户端
-            "dst_port": server_port,  # 目的端口=服务器
-            "operation": op_type,  # 添加操作信息
-            "address": addr,  # 添加地址
-            "count": count,  # 添加数量
-            "error_type": error_type,
-            "error_msg": error_msg
-        })
-
     async def _update_timing_stats(self, master_id, send_time,
                                    last_send_time, last_response_time,
                                    network_latency_ms, op_type):
-        """精确更新时序统计信息"""
-        # 1. 计算真实轮询周期（两次请求发送间隔）
-        true_poll_interval = (send_time - last_send_time) * 1000
-
-        # 2. 计算等待时间（本次请求发送 - 上次响应接收）
-        wait_time = (send_time - last_response_time) * 1000
+        """更新时序统计信息 - 轮询周期改为上次响应到下次发送的时间"""
+        # 计算真实的轮询周期（上次响应结束到本次请求开始）
+        poll_cycle = (send_time - last_response_time) * 1000  # ms
 
         # 更新全局轮询周期记录
-        self.global_stats["轮询周期记录"].append(true_poll_interval)
+        self.global_stats["轮询周期记录"].append(poll_cycle)
 
         # 更新全局最大值和最小值
-        if true_poll_interval > self.global_stats["轮询周期统计"]["最大值"]:
-            self.global_stats["轮询周期统计"]["最大值"] = true_poll_interval
-        if true_poll_interval < self.global_stats["轮询周期统计"]["最小值"]:
-            self.global_stats["轮询周期统计"]["最小值"] = true_poll_interval
+        if poll_cycle > self.global_stats["轮询周期统计"]["最大值"]:
+            self.global_stats["轮询周期统计"]["最大值"] = poll_cycle
+        if poll_cycle < self.global_stats["轮询周期统计"]["最小值"]:
+            self.global_stats["轮询周期统计"]["最小值"] = poll_cycle
 
         # 更新客户端统计
         client_stats = self.client_stats[master_id]
 
         # 轮询周期统计
         poll_cum_stats = client_stats["轮询周期累积"]
-        poll_cum_stats["总和"] += true_poll_interval
+        poll_cum_stats["总和"] += poll_cycle
         poll_cum_stats["计数"] += 1
-        if true_poll_interval > poll_cum_stats["最大值"]:
-            poll_cum_stats["最大值"] = true_poll_interval
-        if true_poll_interval < poll_cum_stats["最小值"]:
-            poll_cum_stats["最小值"] = true_poll_interval
+        if poll_cycle > poll_cum_stats["最大值"]:
+            poll_cum_stats["最大值"] = poll_cycle
+        if poll_cycle < poll_cum_stats["最小值"]:
+            poll_cum_stats["最小值"] = poll_cycle
 
-        client_stats["轮询周期记录"].append(true_poll_interval)
-
-        # 等待时间统计
-        wait_cum_stats = client_stats["等待时间累积"]
-        wait_cum_stats["总和"] += wait_time
-        wait_cum_stats["计数"] += 1
-        if wait_time > wait_cum_stats["最大值"]:
-            wait_cum_stats["最大值"] = wait_time
-        if wait_time < wait_cum_stats["最小值"]:
-            wait_cum_stats["最小值"] = wait_time
-
-        client_stats["等待时间记录"].append(wait_time)
+        client_stats["轮询周期记录"].append(poll_cycle)
 
         # 更新延迟统计
         async with self.stats_lock:
@@ -907,15 +860,17 @@ class HighPrecisionAsyncModbusClient:
         # 使用累积变量计算平均值
         if cum_stats["计数"] > 0:
             cycle_stats["平均轮询周期"] = cum_stats["总和"] / cum_stats["计数"]
-            cycle_stats["最大轮询极期"] = cum_stats["最大值"]
+            cycle_stats["最大轮询周期"] = cum_stats["最大值"]
             cycle_stats["最小轮询周期"] = cum_stats["最小值"]
         else:
             cycle_stats["平均轮询周期"] = 0.0
             cycle_stats["最大轮询周期"] = 0.0
             cycle_stats["最小轮询周期"] = float('inf')
 
-        # 抖动计算仍然需要最近100个点
+        # 计算百分位值
         cycles_list = list(stats["轮询周期记录"])
+
+        # 抖动计算最近100个点
         recent_cycles = cycles_list[-100:] if len(cycles_list) > 100 else cycles_list
 
         if not recent_cycles:
@@ -940,65 +895,20 @@ class HighPrecisionAsyncModbusClient:
         else:
             cycle_stats["轮询周期抖动"] = 0.0
 
-    def _update_wait_time_stats(self, master_id):
-        """高效更新等待时间统计"""
-        stats = self.client_stats[master_id]
-        wait_stats = stats["等待时间统计"]
-        cum_stats = stats["等待时间累积"]
-        wait_records = stats["等待时间记录"]
-
-        # 使用累积变量计算平均值
-        if cum_stats["计数"] > 0:
-            wait_stats["平均等待时间"] = cum_stats["总和"] / cum_stats["计数"]
-            wait_stats["最大等待时间"] = cum_stats["最大值"]
-            wait_stats["最小等待时间"] = cum_stats["最小值"]
-        else:
-            wait_stats["平均等待时间"] = 0.0
-            wait_stats["最大等待时间"] = 0.0
-            wait_stats["最小等待时间"] = float('inf')
-
-        # 抖动计算使用最近100个点
-        recent_waits = list(wait_records)[-100:] if len(wait_records) > 100 else list(wait_records)
-
-        if not recent_waits:
-            wait_stats["等待时间抖动"] = 0.0
-            return
-
-        # 计算抖动（标准差）
-        if len(recent_waits) > 1:
-            # 使用Welford算法提高数值稳定性
-            mean = 0.0
-            m2 = 0.0
-            for i, x in enumerate(recent_waits, 1):
-                delta = x - mean
-                mean += delta / i
-                delta2 = x - mean
-                m2 += delta * delta2
-
-            current_jitter = (m2 / (len(recent_waits) - 1)) ** 0.5
-            wait_stats["等待时间抖动"] = current_jitter
-            if current_jitter > wait_stats["最大等待时间抖动"]:
-                wait_stats["最大等待时间抖动"] = current_jitter
-        else:
-            wait_stats["等待时间抖动"] = 0.0
-
     def _get_client_poll_cycle_stats_str(self, master_id):
-        """重构客户端统计字符串 - 显示等待时间和抖动"""
+        """客户端统计字符串"""
         poll_stats = self.client_stats[master_id]["轮询周期统计"]
-        wait_stats = self.client_stats[master_id]["等待时间统计"]
 
         # 格式化数字
         formatted_poll_avg = f"{poll_stats['平均轮询周期']:.3f}".rjust(6)
-        formatted_wait_avg = f"{wait_stats['平均等待时间']:.3f}".rjust(6)
-        formatted_wait_jitter = f"{wait_stats['等待时间抖动']:.3f}".rjust(6)
-        formatted_max_wait_jitter = f"{wait_stats['最大等待时间抖动']:.3f}".rjust(6)
+        formatted_poll_jitter = f"{poll_stats['轮询周期抖动']:.3f}".rjust(6)
+        formatted_max_jitter = f"{poll_stats['最大轮询周期抖动']:.3f}".rjust(6)
 
         return (
             f"[客户端 {master_id}] "
             f"轮询周期: {formatted_poll_avg}ms | "
-            f"等待时间: {formatted_wait_avg}ms | "
-            f"抖动: {formatted_wait_jitter}ms | "
-            f"最大抖动: {formatted_max_wait_jitter}ms"
+            f"抖动: {formatted_poll_jitter}ms | "
+            f"最大抖动: {formatted_max_jitter}ms"
         )
 
     def print_all_client_poll_cycle_stats(self):
@@ -1009,7 +919,6 @@ class HighPrecisionAsyncModbusClient:
         # 打印所有客户端统计
         for master_id in self.master_ids:
             self._update_poll_cycle_stats(master_id)  # 轮询周期统计
-            self._update_wait_time_stats(master_id)  # 新增：更新等待时间统计
             print(self._get_client_poll_cycle_stats_str(master_id))
 
         # 添加空行使输出更清晰
@@ -1187,8 +1096,48 @@ class HighPrecisionAsyncModbusClient:
             logger.warning(f"关闭连接异常: {e} | {self._get_conn_info(client)}")
 
     def _generate_report(self):
-        """生成包含所有客户端统计的详细报告（更新为轮询周期统计）"""
+        """生成包含所有客户端统计的详细报告"""
         self._calculate_global_percentiles()
+
+        # 计算所有客户端的轮询周期百分位
+        for master_id, stats in self.client_stats.items():
+            poll_cycles = list(stats["轮询周期记录"])
+            cycle_stats = stats["轮询周期统计"]
+
+            # 计算百分位值
+            if poll_cycles:
+                sorted_cycles = sorted(poll_cycles)
+                n = len(sorted_cycles)
+                cycle_stats["p50"] = sorted_cycles[int(n * 0.50)]
+                cycle_stats["p95"] = sorted_cycles[int(n * 0.95)]
+                cycle_stats["p99"] = sorted_cycles[int(n * 0.99)]
+            else:
+                cycle_stats["p50"] = 0.0
+                cycle_stats["p95"] = 0.0
+                cycle_stats["p99"] = 0.0
+
+            # 计算标准差抖动率
+            if len(poll_cycles) > 1:
+                # 使用Welford算法计算标准差
+                mean = 0.0
+                m2 = 0.0
+                for i, x in enumerate(poll_cycles, 1):
+                    delta = x - mean
+                    mean += delta / i
+                    delta2 = x - mean
+                    m2 += delta * delta2
+
+                std_dev = (m2 / (len(poll_cycles) - 1)) ** 0.5
+                # 计算标准差抖动率（标准差/平均周期 * 100%）
+                avg_cycle = cycle_stats["平均轮询周期"]
+                jitter_rate = (std_dev / avg_cycle) * 100 if avg_cycle > 0 else 0
+
+                cycle_stats["轮询周期标准差"] = std_dev
+                cycle_stats["标准差抖动率"] = jitter_rate
+            else:
+                cycle_stats["轮询周期标准差"] = 0.0
+                cycle_stats["标准差抖动率"] = 0.0
+
         # 准备报告头部
         report_lines = [
             "=== Modbus多客户端测试报告 ===",
@@ -1209,8 +1158,22 @@ class HighPrecisionAsyncModbusClient:
         qps = total_requests / duration if duration > 0 else 0
         success_rate = (total_success / total_requests * 100) if total_requests > 0 else 0
 
-        # 添加全局轮询周期统计
-        global_cycle_stats = self.global_stats["轮询周期统计"]
+        # 全局报文延迟统计
+        all_latencies = []
+        for stats in self.client_stats.values():
+            all_latencies.extend(stats["报文延迟统计"]["所有报文"])
+
+        if all_latencies:
+            sorted_latencies = sorted(all_latencies)
+            n = len(sorted_latencies)
+            avg_latency = sum(sorted_latencies) / n
+            min_latency = min(sorted_latencies)
+            max_latency = max(sorted_latencies)
+            p50 = sorted_latencies[int(n * 0.5)] if n > 0 else 0
+            p95 = sorted_latencies[int(n * 0.95)] if n > 1 else 0
+            p99 = sorted_latencies[int(n * 0.99)] if n > 2 else 0
+        else:
+            avg_latency = min_latency = max_latency = p50 = p95 = p99 = 0.0
 
         report_lines.extend([
             f"运行时长: {duration:.2f}秒",
@@ -1221,13 +1184,12 @@ class HighPrecisionAsyncModbusClient:
             f"QPS: {qps:.2f}",
             f"成功率: {success_rate:.2f}%",
             "",
-            "全局轮询周期统计:",
-            f"  最小轮询周期: {global_cycle_stats['最小值']:.3f}ms",
-            f"  最大轮询周期: {global_cycle_stats['最大值']:.3f}ms",
-            f"  P50: {global_cycle_stats['p50']:.3f}ms",
-            f"  P95: {global_cycle_stats['p95']:.3f}ms",
-            f"  P99: {global_cycle_stats['p99']:.3f}ms",
-        ""
+            "报文应答耗时统计:",
+            f"  平均值: {avg_latency:.3f}ms",
+            f"  最小值: {min_latency:.3f}ms",
+            f"  最大值: {max_latency:.3f}ms",
+            f"  数据分布: P50={p50:.3f}ms, P95={p95:.3f}ms, P99={p99:.3f}ms",
+            "",
             "=== 客户端详细统计 ==="
         ])
 
@@ -1243,28 +1205,6 @@ class HighPrecisionAsyncModbusClient:
             if cycle_time is None:
                 cycle_time = 1.0 / settings.TARGET_FREQUENCY
 
-            report_lines.extend([
-                f"\n--- 客户端 [{master_id}] ---",
-                f"描述: {config.get('description', '无描述')}",
-                f"设定轮询周期: {cycle_time * 1000:.3f}ms",  # 更新为轮询周期
-                f"运行时长: {client_duration:.2f}秒",
-                f"总请求数: {client_requests}",
-                f"成功请求: {stats['成功请求']}",
-                f"失败请求: {stats['失败请求']}",
-                f"超时请求: {stats['超时请求']}",  # 添加超时请求统计
-                f"QPS: {client_qps:.2f}",
-                f"成功率: {(stats['成功请求'] / client_requests * 100) if client_requests > 0 else 0:.2f}%",
-                "",
-                "轮询周期统计:",  # 更新为轮询周期统计
-                f"  平均轮询周期: {stats['轮询周期统计']['平均轮询周期']:.6f}ms",  # 更新字段名
-                f"  最大轮询周期: {stats['轮询周期统计']['最大轮询周期']:.6f}ms",  # 更新字段名
-                f"  最小轮询周期: {stats['轮询周期统计']['最小轮询周期']:.6f}ms",  # 更新字段名
-                f"  轮询周期抖动: {stats['轮询周期统计']['轮询周期抖动']:.6f}ms",  # 更新字段名
-                f"  最大抖动: {stats['轮询周期统计']['最大轮询周期抖动']:.6f}ms",
-                "",
-                "报文延迟统计:",
-            ])
-
             # 延迟百分位计算
             if stats['报文延迟统计']['所有报文']:
                 sorted_latencies = sorted(stats['报文延迟统计']['所有报文'])
@@ -1272,9 +1212,41 @@ class HighPrecisionAsyncModbusClient:
                 p50 = sorted_latencies[int(n * 0.5)] if n > 0 else 0
                 p95 = sorted_latencies[int(n * 0.95)] if n > 1 else 0
                 p99 = sorted_latencies[int(n * 0.99)] if n > 2 else 0
+                avg_latency = sum(sorted_latencies) / n
+            else:
+                p50 = p95 = p99 = avg_latency = 0.0
 
-                report_lines.append(f"  所有报文延迟: avg={sum(sorted_latencies) / n:.3f}ms, "
-                                    f"p50={p50:.3f}ms, p95={p95:.3f}ms, p99={p99:.3f}ms")
+            # 轮询周期统计
+            poll_stats = stats["轮询周期统计"]
+            avg_poll_cycle = poll_stats["平均轮询周期"]
+            min_poll_cycle = poll_stats["最小轮询周期"]
+            max_poll_cycle = poll_stats["最大轮询周期"]
+            std_dev = poll_stats["轮询周期标准差"]
+            jitter_rate = poll_stats["标准差抖动率"]
+
+            report_lines.extend([
+                f"\n--- 客户端 [{master_id}] ---",
+                f"描述: {config.get('description', '无描述')}",
+                f"设定轮询周期: {cycle_time * 1000:.3f}ms",
+                f"运行时长: {client_duration:.2f}秒",
+                f"总请求数: {client_requests}",
+                f"成功请求: {stats['成功请求']}",
+                f"失败请求: {stats['失败请求']}",
+                f"超时请求: {stats['超时请求']}",
+                f"QPS: {client_qps:.2f}",
+                f"成功率: {(stats['成功请求'] / client_requests * 100) if client_requests > 0 else 0:.2f}%",
+                "",
+                "轮询周期统计:",
+                f"  平均值: {avg_poll_cycle:.3f}ms",
+                f"  最小值: {min_poll_cycle:.3f}ms",
+                f"  最大值: {max_poll_cycle:.3f}ms",
+                f"  标准差: {std_dev:.3f}ms",
+                f"  标准差抖动率: {jitter_rate:.2f}%",
+                f"  数据分布: P50={stats['轮询周期统计']['p50']:.3f}ms, P95={stats['轮询周期统计']['p95']:.3f}ms, P99={stats['轮询周期统计']['p99']:.3f}ms",
+                "",
+                "报文应答耗时统计:",
+                f"  所有报文: avg={avg_latency:.3f}ms, p50={p50:.3f}ms, p95={p95:.3f}ms, p99={p99:.3f}ms",
+            ])
 
             # 各操作类型延迟
             for op_type in ['read_input_registers', 'read_holding_registers', 'write_registers']:
