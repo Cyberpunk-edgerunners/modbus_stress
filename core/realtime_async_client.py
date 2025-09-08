@@ -578,15 +578,15 @@ class HighPrecisionAsyncModbusClient:
             remaining = target_time - current_time
 
             # 大于1ms时使用混合等待
-            if remaining > 0.001:  # >1ms
+            if remaining > 0.002:  # >2ms
                 sleep_time = remaining * 0.7
                 spin_time = remaining - sleep_time
                 time.sleep(sleep_time)
                 self._spin_wait(spin_time)
                 return
 
-            # 100μs-1ms使用纯忙等待
-            elif remaining > 0.0001:  # 100μs-1ms
+            # 100μs-2ms使用纯忙等待
+            elif remaining > 0.0001:  # 100μs-2ms
                 self._spin_wait(remaining)
                 return
 
@@ -724,7 +724,7 @@ class HighPrecisionAsyncModbusClient:
                 self.register_stats["global"]["holding"]["writes"] += 1
 
         try:
-            # 在锁定前保存历史响应时间
+            # 在验证前保存历史响应时间
             async with ctx["operation_lock"]:
                 historical_response_time = ctx["last_network_response_received"]
             # 使用连接池执行请求并获取精确时间戳
@@ -787,18 +787,17 @@ class HighPrecisionAsyncModbusClient:
 
                 verify_start = self._clock()
                 try:
-                    verify_result, _, _, _ = await self.pool.execute(
+                    verify_result, verify_send_time, verify_recv_time, _ = await self.pool.execute(
                         client,
                         1,
                         addr,
                         count,
                     )
-                    verify_recv_time = self._clock()
-
-                    verify_latency_ms = (verify_recv_time - verify_start) * 1000
+                    verify_recv_time = verify_recv_time
+                    verify_latency_ms = (verify_recv_time - verify_send_time) * 1000
 
                     await self._log_request(
-                        master_id, verify_start, 1, addr, count, None, client_port, server_port
+                        master_id, verify_send_time, 1, addr, count, None, client_port, server_port
                     )
                     await self._log_response(
                         master_id, verify_recv_time, 1, addr, count, verify_latency_ms, client_port, server_port
@@ -823,7 +822,7 @@ class HighPrecisionAsyncModbusClient:
 
                     # 验证读后恢复原始响应时间
                     async with ctx["operation_lock"]:
-                        ctx["last_network_response_received"] = original_response_time
+                        ctx["last_network_response_received"] = verify_recv_time
                 except Exception as e:
                     logger.error(f"验证读失败: {e}")
                     verification_result = False
@@ -844,7 +843,7 @@ class HighPrecisionAsyncModbusClient:
 
                     # 验证失败后也恢复原始响应时间
                     async with ctx["operation_lock"]:
-                        ctx["last_network_response_received"] = original_response_time
+                        ctx["last_network_response_received"] = verify_recv_time
 
             return True, verification_result
 

@@ -46,27 +46,27 @@ INPUT_REGISTER_RANGE = (0, 9)
 MASTER_CONFIGS = {
     "master_1": {
         "description": "主站1",
-        "HOLDING_REGISTER_RANGE": (0,100),
+        "HOLDING_REGISTER_RANGE": (0,499),
         "disconnect_prob": 0,
         "reconnect_delay": (0, 0),
         "cycle_time": 0.001
     },
     "master_2": {
         "description": "主站2",
-        "HOLDING_REGISTER_RANGE": (0, 999),
+        "HOLDING_REGISTER_RANGE": (500, 999),
         "disconnect_prob": 0,
         "reconnect_delay": (60, 300),
         "cycle_time": 0.001
     },
     "master_3": {
         "description": "主站3",
-        "HOLDING_REGISTER_RANGE": (0, 999),
+        "HOLDING_REGISTER_RANGE": (1000, 1499),
         "disconnect_prob": 0,
         "cycle_time": 0.001
     },
     "master_4": {
         "description": "主站4",
-        "HOLDING_REGISTER_RANGE": (0, 999),
+        "HOLDING_REGISTER_RANGE": (1500, 1999),
         "disconnect_prob": 0,
         "cycle_time": 0.001
     }
